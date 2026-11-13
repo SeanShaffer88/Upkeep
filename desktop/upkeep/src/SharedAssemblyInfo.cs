@@ -9,9 +9,9 @@ using System.Runtime.Versioning;
 [assembly: AssemblyDefaultAlias("Upkeep")]
 [assembly: AssemblyCompany("Upkeep contributors")]
 [assembly: AssemblyCopyright("Copyright 2026 Upkeep contributors; portions copyright their respective UniGetUI contributors.")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
-[assembly: AssemblyInformationalVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyInformationalVersion("1.0.1.0")]
 #if WINDOWS
 [assembly: SupportedOSPlatform("windows10.0.19041")]
 #endif

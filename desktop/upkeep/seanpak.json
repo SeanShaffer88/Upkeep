@@ -1,6 +1,6 @@
 {
   "appName": "Upkeep",
-  "version": "1.0.0.0",
+  "version": "1.0.1.0",
   "publisher": "Upkeep",
   "primaryExe": "Upkeep.exe",
   "installLocation": "C:\\Program Files\\Upkeep",

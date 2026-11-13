@@ -69,6 +69,16 @@ jobs:
       - name: Attach release assets
         uses: softprops/action-gh-release@v2
         with:
+          body: |
+            Upkeep is a focused Windows 11 x64 app for software updates.
+
+            ## Downloads
+            - `*-Setup.exe` installs Upkeep.
+            - `*-Portable.zip` runs without installation.
+            - `SHA256SUMS.txt` contains checksums for the release files.
+
+            ## Diagnostics
+            Run `Upkeep.exe -debug` to export recent package-update details to a text file on the Desktop. Review the report before sharing.
           files: |
             desktop/upkeep/dist/release/*-Setup.exe
             desktop/upkeep/dist/release/*-Portable.zip

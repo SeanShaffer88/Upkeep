@@ -27,6 +27,8 @@
         <AssemblyName>UniGetUI</AssemblyName>
         <Product>Upkeep</Product>
         <Description>Software updates for Windows 11</Description>
+        <RepositoryUrl>https://github.com/SeanShaffer88/Upkeep</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
         <ApplicationIcon>Assets\Images\Upkeep.ico</ApplicationIcon>
         <SkipCliLauncher>true</SkipCliLauncher>
         <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>

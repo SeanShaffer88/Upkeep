@@ -2,6 +2,8 @@
 
 Upkeep is a Windows 11 x64 desktop app for finding and installing software updates. Its update screen and package-update engine are derived from [UniGetUI](https://github.com/marticliment/UniGetUI); the rest of UniGetUI's user-facing pages are not exposed.
 
+Download the latest release from [GitHub Releases](https://github.com/SeanShaffer88/Upkeep/releases/latest). Use the Setup executable to install, or the Portable ZIP to run without installation. Packages are x64-only; verify downloads with `SHA256SUMS.txt`.
+
 ## Build
 
 Requires the .NET 10 SDK and Windows 11 x64.
@@ -29,3 +31,7 @@ This build is intentionally limited to the software-update workflow and Windows 
 - Upkeep keeps its own settings and machine-wide data separate from UniGetUI. The app itself is released through SeanPak packages, not UniGetUI's self-update feed.
 
 The portable folder scanner is a discovery aid. Arbitrary GitHub or PortableFreeware download-and-replace flows are not enabled.
+
+## Troubleshooting
+
+Run `Upkeep.exe -debug` from PowerShell or Command Prompt to export the latest package-update records to a timestamped text file on your Desktop. If the Desktop cannot be used, the file is saved in the temporary folder. The report includes installer output and basic redaction for credentials and user-profile paths; review it before sharing.
