@@ -116,6 +116,11 @@ jobs:
         continue-on-error: true
         run: dotnet test desktop/upkeep/src/UniGetUI.Tests/UniGetUI.Tests.csproj --configuration Release --framework net10.0-windows10.0.26100.0 --property:Platform=x64 --filter FullyQualifiedName~SidebarNavigationOrderTests --verbosity minimal
 
+      - name: Test debug log export
+        id: debug_log_test
+        continue-on-error: true
+        run: dotnet test desktop/upkeep/src/UniGetUI.Tests/UniGetUI.Tests.csproj --configuration Release --framework net10.0-windows10.0.26100.0 --property:Platform=x64 --filter FullyQualifiedName~DebugLogCommandTests --verbosity minimal
+
       - name: Fail if any focused check failed
         if: always()
         shell: pwsh
@@ -123,11 +128,13 @@ jobs:
           INSTALLER_OUTCOME: ${{ steps.installer_verify.outcome }}
           SCHEDULING_OUTCOME: ${{ steps.scheduling_test.outcome }}
           NAVIGATION_OUTCOME: ${{ steps.navigation_test.outcome }}
+          DEBUG_LOG_OUTCOME: ${{ steps.debug_log_test.outcome }}
         run: |
           $failures = @()
           if ($env:INSTALLER_OUTCOME -eq 'failure') { $failures += 'installer install/uninstall' }
           if ($env:SCHEDULING_OUTCOME -eq 'failure') { $failures += 'update scheduling' }
           if ($env:NAVIGATION_OUTCOME -eq 'failure') { $failures += 'update-only navigation' }
+          if ($env:DEBUG_LOG_OUTCOME -eq 'failure') { $failures += 'debug log export' }
           if ($failures.Count -gt 0) {
             throw "Focused checks failed: $($failures -join ', ')"
           }

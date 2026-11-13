@@ -45,6 +45,13 @@ sealed class Program
 
         PersistedEnvironment.Initialize();
 
+        if (DebugLogCommand.IsCommand(args))
+        {
+            WindowsConsoleHost.PrepareCliIO(allowAllocateIfNoParent: true);
+            Environment.ExitCode = DebugLogCommand.Run(Console.Out, Console.Error);
+            return;
+        }
+
         if (args.Length > 0 && args[0] == "skills")
         {
             WindowsConsoleHost.PrepareCliIO();
