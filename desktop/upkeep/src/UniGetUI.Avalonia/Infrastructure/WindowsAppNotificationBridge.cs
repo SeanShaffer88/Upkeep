@@ -1,0 +1,303 @@
+using System.Collections.Generic;
+using UniGetUI.Avalonia.Views;
+using UniGetUI.Core.Data;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.SettingsEngine;
+using UniGetUI.Core.Tools;
+using UniGetUI.Interface.Enums;
+using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageOperations;
+
+namespace UniGetUI.Avalonia.Infrastructure;
+
+/// <summary>
+/// Delivers UniGetUI's notifications via native Windows Action-Center toasts using the
+/// UWP <c>Windows.UI.Notifications</c> COM surface, with no Windows App SDK / WinUI
+/// dependency. Toasts are show-only: clicking a toast launches the app through the
+/// <c>unigetui://</c> deep-link (registered by the installer) so the existing
+/// single-instance handler foregrounds the window. The inline action buttons carried
+/// by the old WinRT toasts are intentionally dropped; activation is surfaced via
+/// <see cref="NotificationActivated"/> only when the app is already running and the toast
+/// is clicked, so the main-window view model keeps its handler. When the toast COM surface
+/// is unavailable, feature notifications fall back to the in-app Avalonia banner via
+/// <see cref="MainWindow.ShowRuntimeNotification"/>; per-operation results do not (they
+/// already appear in the operations panel — see the <c>allowInAppFallback</c> flag on Show).
+/// </summary>
+internal static class WindowsAppNotificationBridge
+{
+    /// <summary>Invoked when a notification's default action is triggered (toast clicked).</summary>
+    public static event Action<string>? NotificationActivated;
+
+    /// <summary>
+    /// Parses a <c>unigetui://&lt;action&gt;</c> launch argument produced by a toast
+    /// click, returning the encoded action or <c>null</c> if the argument is not a toast
+    /// deep-link. Used by the secondary-instance handler to route toast activations.
+    /// </summary>
+    public static string? TryParseToastLaunchArgument(string arg)
+    {
+        // Package links name a package rather than an action; StartupArgumentProcessor opens them.
+        if (string.IsNullOrEmpty(arg) || PackageLink.IsPackageLink(arg))
+            return null;
+
+        const string prefix = "unigetui://";
+        if (!arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        string action = arg[prefix.Length..].Trim('/');
+        return action.Length > 0 ? action : null;
+    }
+
+    /// <summary>Raises <see cref="NotificationActivated"/> with the given action.</summary>
+    public static void RaiseActivation(string action)
+    {
+        try { NotificationActivated?.Invoke(action); }
+        catch (Exception ex)
+        {
+            Logger.Warn("NotificationActivated raise failed");
+            Logger.Warn(ex);
+        }
+    }
+
+    public static bool ShowProgress(AbstractOperation operation)
+    {
+        string title = operation.Metadata.Title.Length > 0
+            ? operation.Metadata.Title
+            : CoreTools.Translate("Operation in progress");
+
+        string message = operation.Metadata.Status.Length > 0
+            ? operation.Metadata.Status
+            : CoreTools.Translate("Please wait...");
+
+        return Show(title, message, MainWindow.RuntimeNotificationLevel.Progress, launchAction: NotificationArguments.Show, allowInAppFallback: false);
+    }
+
+    public static bool ShowSuccess(AbstractOperation operation)
+    {
+        string title = OperationNotificationText.SuccessTitle(operation);
+        string message = OperationNotificationText.SuccessMessage(operation);
+
+        return Show(title, message, MainWindow.RuntimeNotificationLevel.Success, launchAction: NotificationArguments.Show, allowInAppFallback: false);
+    }
+
+    public static bool ShowError(AbstractOperation operation)
+    {
+        string title = operation.Metadata.FailureTitle.Length > 0
+            ? operation.Metadata.FailureTitle
+            : CoreTools.Translate("Failed");
+
+        string message = operation.Metadata.FailureMessage.Length > 0
+            ? operation.Metadata.FailureMessage
+            : CoreTools.Translate("An error occurred while processing this package");
+
+        return Show(title, message, MainWindow.RuntimeNotificationLevel.Error, launchAction: NotificationArguments.Show, allowInAppFallback: false);
+    }
+
+    public static void RemoveProgress(AbstractOperation operation)
+    {
+        // The UWP toast surface has no tag-based remove without the WinAppSDK helper.
+        // Progress toasts are short-lived and replaced by the subsequent success/error toast.
+        _ = operation;
+    }
+
+    // ── updates-available notification ───────────────────────────────────────
+
+    internal const string UpdatesToastTag = "updates-available";
+    internal const string SelfUpdateToastTag = "self-update-available";
+
+    internal static bool KeepsUntilDismissed(string? tag, bool persistentUpdateNotifications)
+        => persistentUpdateNotifications && tag is (UpdatesToastTag or SelfUpdateToastTag);
+
+    public static void RemoveUpdatesAvailableNotification()
+    {
+#if WINDOWS
+        Win32ToastNotifier.Remove(UpdatesToastTag);
+#endif
+    }
+
+    public static void RemoveSelfUpdateAvailableNotification()
+    {
+#if WINDOWS
+        Win32ToastNotifier.Remove(SelfUpdateToastTag);
+#endif
+    }
+
+    /// <summary>
+    /// Shows a Windows toast notification listing available package updates. No-op on
+    /// non-Windows or when notifications are disabled (mirrors the previous bridge's
+    /// platform guard so macOS/Linux stay untouched).
+    /// </summary>
+    public static void ShowExtensionUpdatesAvailableNotification(string name, int count, string action)
+    {
+        if (!OperatingSystem.IsWindows() || Settings.AreUpdatesNotificationsDisabled()) return;
+        try
+        {
+            Show(CoreTools.Translate("{0} updates", name), CoreTools.Translate("{0} skills can be updated", count),
+                MainWindow.RuntimeNotificationLevel.Success, action);
+        }
+        catch (Exception ex) { Logger.Warn(ex); }
+    }
+
+    public static void ShowUpdatesAvailableNotification(IReadOnlyList<IPackage> upgradable)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        if (Settings.AreUpdatesNotificationsDisabled()) return;
+
+        bool sendNotification = upgradable.Any(p =>
+            !Settings.GetDictionaryItem<string, bool>(
+                Settings.K.DisabledPackageManagerNotifications, p.Manager.Name));
+        if (!sendNotification) return;
+
+        try
+        {
+            if (upgradable.Count == 1)
+            {
+                Show(
+                    CoreTools.Translate("An update was found!"),
+                    CoreTools.Translate("{0} can be updated to version {1}",
+                        upgradable[0].Name, upgradable[0].NewVersionString),
+                    MainWindow.RuntimeNotificationLevel.Success,
+                    launchAction: NotificationArguments.ShowOnUpdatesTab,
+                    tag: UpdatesToastTag);
+            }
+            else
+            {
+                Show(
+                    CoreTools.Translate("Updates found!"),
+                    CoreTools.Translate("{0} packages can be updated", upgradable.Count),
+                    MainWindow.RuntimeNotificationLevel.Success,
+                    launchAction: NotificationArguments.ShowOnUpdatesTab,
+                    tag: UpdatesToastTag);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("Could not show updates-available notification");
+            Logger.Warn(ex);
+        }
+    }
+
+    /// <summary>
+    /// Shows a Windows toast notification when packages are actively being updated (auto-update triggered).
+    /// </summary>
+    public static void ShowUpgradingPackagesNotification(IReadOnlyList<IPackage> upgradable)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        if (Settings.AreUpdatesNotificationsDisabled()) return;
+
+        bool sendNotification = upgradable.Any(p =>
+            !Settings.GetDictionaryItem<string, bool>(
+                Settings.K.DisabledPackageManagerNotifications, p.Manager.Name));
+        if (!sendNotification) return;
+
+        try
+        {
+            if (upgradable.Count == 1)
+            {
+                Show(
+                    CoreTools.Translate("An update was found!"),
+                    CoreTools.Translate("{0} is being updated to version {1}",
+                        upgradable[0].Name, upgradable[0].NewVersionString),
+                    MainWindow.RuntimeNotificationLevel.Progress,
+                    launchAction: NotificationArguments.ShowOnUpdatesTab);
+            }
+            else
+            {
+                string attribution = string.Join(", ", upgradable
+                    .Where(p => !Settings.GetDictionaryItem<string, bool>(
+                        Settings.K.DisabledPackageManagerNotifications, p.Manager.Name))
+                    .Select(p => p.Name));
+
+                Show(
+                    CoreTools.Translate("{0} packages are being updated", upgradable.Count),
+                    attribution,
+                    MainWindow.RuntimeNotificationLevel.Progress,
+                    launchAction: NotificationArguments.ShowOnUpdatesTab);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("Could not show upgrading-packages notification");
+            Logger.Warn(ex);
+        }
+    }
+
+    /// <summary>
+    /// Shows a Windows toast offering a UniGetUI self-update.
+    /// </summary>
+    public static void ShowSelfUpdateAvailableNotification(string newVersion)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            Show(
+                CoreTools.Translate("{0} can be updated to version {1}", "Upkeep", newVersion),
+                CoreTools.Translate("You have currently version {0} installed", CoreData.VersionName),
+                MainWindow.RuntimeNotificationLevel.Success,
+                launchAction: NotificationArguments.ShowSelfUpdate,
+                allowInAppFallback: false,
+                tag: SelfUpdateToastTag);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("Could not show self-update notification");
+            Logger.Warn(ex);
+        }
+    }
+
+    /// <summary>
+    /// Shows a native toast when available, otherwise falls back to the in-app banner.
+    /// The <paramref name="launchAction"/> is encoded into the <c>unigetui://</c> launch
+    /// argument so the single-instance handler can route the activation when the toast
+    /// is clicked. Returns <c>true</c> once the notification has been surfaced (toast or
+    /// banner), so callers skip their own fallback banner and avoid double-showing.
+    /// <paramref name="allowInAppFallback"/> is <c>false</c> for per-operation results:
+    /// those already live in the operations panel, so we don't duplicate them as a toast.
+    /// </summary>
+    private static bool Show(
+        string title,
+        string message,
+        MainWindow.RuntimeNotificationLevel level,
+        string launchAction,
+        bool allowInAppFallback = true,
+        string? tag = null)
+    {
+#if WINDOWS
+        // Only fire an OS toast when the app is out of sight (minimized or hidden to the tray).
+        // While the window is on screen the user can already see the operations panel / in-app
+        // toast, so a native toast would just be noise; fall through to the in-app path instead.
+        if (OperatingSystem.IsWindows() && !MainWindow.IsWindowOnScreen && Win32ToastNotifier.IsAvailable())
+        {
+            string launchArg = BuildLaunchArgument(launchAction);
+            bool untilDismissed = KeepsUntilDismissed(tag, Settings.Get(Settings.K.PersistentUpdateNotifications));
+            if (Win32ToastNotifier.Show(title, message, launchArg, tag, untilDismissed))
+            {
+                // Show-only: the launch action fires only when the user clicks the toast, routed via
+                // the unigetui:// deep-link through the single-instance handler. Raising it on show
+                // would navigate the app on its own (e.g. yank to Updates the moment updates load).
+                return true;
+            }
+        }
+#endif
+
+        return allowInAppFallback && ShowInAppBanner(title, message, level, launchAction);
+    }
+
+    private static bool ShowInAppBanner(
+        string title,
+        string message,
+        MainWindow.RuntimeNotificationLevel level,
+        string launchAction)
+    {
+        var mainWindow = MainWindow.Instance;
+        if (mainWindow is null)
+            return false;
+
+        mainWindow.ShowRuntimeNotification(title, message, level, launchAction);
+        return true;
+    }
+
+#if WINDOWS
+    private static string BuildLaunchArgument(string action)
+        => $"unigetui://{action}";
+#endif
+}

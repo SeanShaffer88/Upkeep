@@ -1,0 +1,391 @@
+using System;
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using System.IO;
+using System.Runtime.InteropServices;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Markup.Xaml;
+using Avalonia.Markup.Xaml.Styling;
+using Avalonia.Styling;
+using Avalonia.Threading;
+#if AVALONIA_DIAGNOSTICS_ENABLED
+using Avalonia.Diagnostics;
+#endif
+using UniGetUI.Avalonia.Assets.Styles;
+using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Avalonia.Views;
+using UniGetUI.Avalonia.Views.Controls;
+using UniGetUI.Avalonia.Views.DialogPages;
+using UniGetUI.Core.Data;
+using UniGetUI.Core.Logging;
+using UniGetUI.Interface.Enums;
+using UniGetUI.PackageEngine;
+using CoreSettings = global::UniGetUI.Core.SettingsEngine.Settings;
+
+namespace UniGetUI.Avalonia;
+
+public partial class App : Application
+{
+    public override void Initialize()
+    {
+        AvaloniaXamlLoader.Load(this);
+
+        ButtonActivationGuard.Install();
+        TabControlFocusGuard.Install();
+        UiAutomationGuard.Install();
+        SmoothScrollManager.Install();
+        IndeterminateProgressBars.Install(this);
+        if (!MacGlassWindowHelper.IsGlassEnabled())
+            Styles.Add(new ScrollBarStyles());
+
+        // Windows 11 Mica look is opt-in per environment: only merge the translucent
+        // surface overrides when Mica is actually usable (Win11 + transparency on).
+        // macOS gets its own look (Styles.MacGlass*); Linux, Windows 10, and Windows with
+        // transparency off keep the solid Styles.Common look.
+        if (MicaWindowHelper.IsMicaEnabled())
+            ApplyWindowsMicaStyling();
+        else
+            MacGlassWindowHelper.Initialize(this);
+#if AVALONIA_DIAGNOSTICS_ENABLED
+        this.AttachDeveloperTools();
+#endif
+    }
+
+    private void ApplyWindowsMicaStyling()
+    {
+        Resources.MergedDictionaries.Add(new WindowsMicaStyles());
+        // Give flyouts/menus/tooltips a native acrylic backdrop (DWM) so they blur + tint
+        // from behind and adapt to the theme.
+        MicaWindowHelper.EnableAcrylicPopups();
+    }
+
+    public override void OnFrameworkInitializationCompleted()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // Redirect WebView2 user-data folder to a writable temp location.
+            // Without this, WebView2 tries to write next to the executable in
+            // C:\Program Files\, which is read-only for non-admin users and
+            // causes UnauthorizedAccessException (E_ACCESSDENIED) on startup.
+            SetUpWebViewUserDataFolder();
+
+            // Safety net for NativeWebView (WebView2) initialization failures thrown
+            // asynchronously on the dispatcher. Without this the app crashes; with it
+            // the Help page shows a fallback "Open in browser" button.
+            Dispatcher.UIThread.UnhandledException += (_, e) =>
+            {
+                if (e.Exception is InvalidOperationException { Message: var msg }
+                    && msg.Contains("child window for native control host"))
+                {
+                    e.Handled = true;
+                    return;
+                }
+
+                // #5285: the web view reports adapter-initialization failures from an
+                // `async void` continuation, so they land here instead of at the call site.
+                // NativeWebViewSupport pre-checks the common cause (no WebView2 runtime), but
+                // a runtime that is present and broken can still fail this late.
+                if (NativeWebViewSupport.IsWebViewFailure(e.Exception))
+                {
+                    Logger.Error("The built-in browser failed to initialize; falling back to the system browser");
+                    Logger.Error(e.Exception);
+                    NativeWebViewSupport.MarkUnavailable();
+                    e.Handled = true;
+                }
+            };
+        }
+
+        if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            // Apply the saved theme before any window is shown so the splash
+            // appears in the user's preferred light/dark variant from the start.
+            ApplyTheme(CoreSettings.GetValue(CoreSettings.K.PreferredTheme));
+
+            // Show the splash before any heavy initialization. Skipped in daemon
+            // mode since the app isn't supposed to be visible at all.
+            SplashWindow? splash = null;
+            if (!CoreData.WasDaemon)
+            {
+                splash = new SplashWindow();
+                splash.Show();
+            }
+
+            // Defer the rest of startup so the splash gets a chance to paint
+            // before we block the UI thread loading package managers and the
+            // main window XAML. Without this the splash window appears empty
+            // until init completes, defeating its purpose.
+            Dispatcher.UIThread.Post(() => StartMainWindow(desktop, splash), DispatcherPriority.Background);
+        }
+
+        base.OnFrameworkInitializationCompleted();
+    }
+
+    private static void StartMainWindow(IClassicDesktopStyleApplicationLifetime desktop, SplashWindow? splash)
+    {
+        if (OperatingSystem.IsMacOS())
+        {
+            // The Dock icon (incl. Default/Dark/Tinted/Clear styling) is provided by the .app bundle's
+            // AppIcon (scripts/macos/AppIcon.icon → Assets.car, via CFBundleIconName) and rendered by
+            // the system — for packaged releases and for Debug builds, which also build into a .app
+            // (see UniGetUI.Avalonia.csproj). There is nothing to do at runtime.
+            //
+            // Only macOS reads its environment from a login shell, so only macOS finishes startup
+            // asynchronously; every other platform stays on the synchronous path below.
+            ResumeStartupAfterMacOSEnvironment(desktop, splash);
+            return;
+        }
+
+        ProcessEnvironmentConfigurator.ApplyProxySettingsToProcess();
+        CreateAndShowMainWindow(desktop, splash);
+    }
+
+    /// <summary>
+    /// #5236: resolving PATH spawns a login shell that can be slow, or stuck for good. Keep it off
+    /// the UI thread so the splash keeps painting, then finish startup once it answers.
+    /// </summary>
+    /// <remarks>
+    /// `async void` on purpose: it hands failures to Dispatcher.UnhandledException (and from there
+    /// to the crash handler), whereas a dropped Task would swallow them.
+    /// </remarks>
+    private static async void ResumeStartupAfterMacOSEnvironment(
+        IClassicDesktopStyleApplicationLifetime desktop, SplashWindow? splash)
+    {
+        // The dispatcher keeps pumping meanwhile, so the app can be asked to quit before the main
+        // window exists. Nothing routes that through MainWindow.QuitApplication() yet, so watch for
+        // it here and abort instead of resurrecting a window on a lifetime that is shutting down.
+        bool quitRequested = false;
+        void MarkQuitRequested(object? _, EventArgs __) => quitRequested = true;
+
+        desktop.ShutdownRequested += MarkQuitRequested;
+        desktop.Exit += MarkQuitRequested;
+        try
+        {
+            await Task.Run(ProcessEnvironmentConfigurator.PrepareForCurrentPlatform);
+        }
+        finally
+        {
+            desktop.ShutdownRequested -= MarkQuitRequested;
+            desktop.Exit -= MarkQuitRequested;
+        }
+
+        if (quitRequested)
+        {
+            Logger.Warn("The application was asked to quit before startup completed; "
+                      + "the main window will not be created");
+            splash?.Close();
+            return;
+        }
+
+        CreateAndShowMainWindow(desktop, splash);
+    }
+
+    private static void CreateAndShowMainWindow(
+        IClassicDesktopStyleApplicationLifetime desktop, SplashWindow? splash)
+    {
+        desktop.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+
+        PEInterface.LoadLoaders();
+        var mainWindow = new MainWindow();
+        desktop.MainWindow = mainWindow;
+        AvaloniaAppHost.SecondaryInstanceArgsReceived += args =>
+            HandleSecondaryInstanceArgs(mainWindow, args);
+
+        desktop.ShutdownRequested += (_, e) => HandleShutdownRequest(
+            e,
+            mainWindow.IsQuitting,
+            fromSessionManager: OperatingSystem.IsLinux(),
+            mainWindow.CanQuitWithoutAsking,
+            mainWindow.QuitApplication);
+
+        if (OperatingSystem.IsLinux())
+            QuitOnTerminationSignals(mainWindow);
+
+        if (Current?.TryGetFeature<IActivatableLifetime>() is { } activatable)
+        {
+            activatable.Activated += (_, e) =>
+            {
+                if (e.Kind == ActivationKind.Reopen)
+                    mainWindow.ShowFromTray();
+            };
+        }
+
+        if (splash is not null)
+        {
+            var splashRef = splash;
+            void CloseSplashOnce(object? s, EventArgs e)
+            {
+                mainWindow.Opened -= CloseSplashOnce;
+                splashRef.Close();
+            }
+            mainWindow.Opened += CloseSplashOnce;
+        }
+
+        // Framework auto-show already passed (we deferred via Dispatcher.Post), so we have to
+        // open the window ourselves. Daemon mode never shows it at all.
+        if (!CoreData.WasDaemon)
+            mainWindow.Show();
+
+        _ = StartupAsync(mainWindow, desktop.Args ?? []);
+    }
+
+    /// <summary>
+    /// Routes the lifetime's shutdown request through <see cref="MainWindow.QuitApplication"/>, which
+    /// asks about unsaved work before it exits.
+    /// </summary>
+    /// <remarks>
+    /// On Linux only the X session manager raises the request, for a logout, restart or shutdown, and
+    /// Avalonia passes `e.Cancel` straight back to it. Cancelling makes the session manager abort the
+    /// logout even though the quit that follows exits the app anyway, so when the quit would not ask
+    /// anything the request is let through and the lifetime closes the windows itself.
+    /// </remarks>
+    internal static void HandleShutdownRequest(
+        ShutdownRequestedEventArgs e,
+        bool isQuitting,
+        bool fromSessionManager,
+        bool canQuitWithoutAsking,
+        Action quit)
+    {
+        if (isQuitting || (fromSessionManager && canQuitWithoutAsking))
+            return;
+
+        e.Cancel = true;
+        quit();
+    }
+
+    // A registration that gets collected stops handling its signal.
+    private static PosixSignalRegistration[]? _terminationSignals;
+    private static int _terminationSignalsReceived;
+
+    /// <summary>
+    /// systemd stops the processes left in a session with SIGTERM, and a terminal sends SIGINT on
+    /// Ctrl+C. The IPC server's host leaves both to this handler on Linux, because its default
+    /// lifetime cancels the termination on every signal, which left the app running.
+    /// </summary>
+    private static void QuitOnTerminationSignals(MainWindow mainWindow)
+    {
+        void Quit(PosixSignalContext context) =>
+            HandleTerminationSignal(
+                context,
+                ref _terminationSignalsReceived,
+                () => Dispatcher.UIThread.Post(mainWindow.QuitApplication));
+
+        _terminationSignals =
+        [
+            PosixSignalRegistration.Create(PosixSignal.SIGTERM, Quit),
+            PosixSignalRegistration.Create(PosixSignal.SIGINT, Quit),
+        ];
+    }
+
+    internal static void HandleTerminationSignal(PosixSignalContext context, ref int signalsReceived, Action quit)
+    {
+        // A later signal takes the default termination, so a quit held up by a prompt can be forced.
+        if (Interlocked.Increment(ref signalsReceived) > 1)
+            return;
+
+        // The runtime would otherwise end the process before the quit has saved anything.
+        context.Cancel = true;
+        quit();
+    }
+
+    private static async Task StartupAsync(MainWindow mainWindow, string[] args)
+    {
+        // Show crash report from the previous session and wait for the user
+        // to dismiss it before continuing with normal startup.
+        if (File.Exists(CrashHandler.PendingCrashFile))
+        {
+            try
+            {
+                string report = File.ReadAllText(CrashHandler.PendingCrashFile);
+                File.Delete(CrashHandler.PendingCrashFile);
+                // Yield once so the main window has time to open before
+                // ShowDialog tries to attach to it as owner.
+                await Task.Yield();
+
+                await mainWindow.ShowDialogAndRestoreVisibilityAsync(new CrashReportWindow(report));
+            }
+            catch { /* must not prevent normal startup */ }
+        }
+
+        await AvaloniaBootstrapper.InitializeAsync();
+
+        if (CoreData.WasDaemon)
+        {
+            StartupArgumentProcessor.WarnIfBundlesIgnored(
+                args, $"the launch requested {AvaloniaCliHandler.DAEMON}");
+            return;
+        }
+
+        await StartupArgumentProcessor.ProcessAsync(args);
+    }
+
+    private static void HandleSecondaryInstanceArgs(MainWindow mainWindow, string[] args)
+    {
+        if (mainWindow.IsQuitting)
+        {
+            Logger.Warn("UniGetUI is quitting, so a forwarded launch will start it again once it has exited");
+            AvaloniaAppHost.RecordLaunchWhileQuitting(args);
+            return;
+        }
+
+        bool isDaemonLaunch = args.Contains(AvaloniaCliHandler.DAEMON);
+        CoreData.IsDaemon = isDaemonLaunch;
+
+        // A toast click launches the app with its unigetui:// deep-link; route the
+        // encoded action to the notification activation handler before foregrounding.
+        if (args is { Length: > 0 })
+        {
+            foreach (string arg in args)
+            {
+                string? action = WindowsAppNotificationBridge.TryParseToastLaunchArgument(arg);
+                if (action is not null)
+                {
+                    WindowsAppNotificationBridge.RaiseActivation(action);
+                    break;
+                }
+            }
+        }
+
+        if (isDaemonLaunch)
+        {
+            StartupArgumentProcessor.WarnIfBundlesIgnored(
+                args, $"the launch requested {AvaloniaCliHandler.DAEMON}");
+            return;
+        }
+
+        mainWindow.ShowFromTray();
+
+        _ = StartupArgumentProcessor.ProcessAsync(args);
+    }
+
+    public static void ApplyTheme(string value)
+    {
+        Current!.RequestedThemeVariant = value switch
+        {
+            "light" => ThemeVariant.Light,
+            "dark" => ThemeVariant.Dark,
+            _ => ThemeVariant.Default,
+        };
+    }
+
+    public static string WebViewUserDataFolder { get; } =
+        Path.Join(AppPaths.ScratchDirectory, "WebView");
+
+    private static void SetUpWebViewUserDataFolder()
+    {
+        try
+        {
+            if (!Directory.Exists(WebViewUserDataFolder))
+                Directory.CreateDirectory(WebViewUserDataFolder);
+
+            Environment.SetEnvironmentVariable("WEBVIEW2_USER_DATA_FOLDER", WebViewUserDataFolder);
+        }
+        catch (Exception e)
+        {
+            Logger.Warn("Could not set up data folder for WebView2");
+            Logger.Warn(e);
+        }
+    }
+
+}

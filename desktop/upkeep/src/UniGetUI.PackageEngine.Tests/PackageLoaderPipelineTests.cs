@@ -1,0 +1,487 @@
+using UniGetUI.PackageEngine.Classes.Manager;
+using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.PackageLoader;
+using UniGetUI.PackageEngine.Tests.Infrastructure.Builders;
+using UniGetUI.PackageEngine.Tests.Infrastructure.Fakes;
+using UniGetUI.PackageEngine.Tests.Infrastructure.Helpers;
+
+namespace UniGetUI.PackageEngine.Tests;
+
+public sealed class PackageLoaderPipelineTests
+{
+    [Fact]
+    public async Task AddForeign_DeduplicatesByPackageHash_WhenVersionAwareIdentityIsDisabled()
+    {
+        var manager = new PackageManagerBuilder().Build();
+        var loader = new TestPackageLoader([manager], allowMultiplePackageVersions: false);
+        var packageV1 = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("1.0.0")
+            .Build();
+        var packageV2 = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("2.0.0")
+            .Build();
+
+        await loader.AddForeign(packageV1);
+        await loader.AddForeign(packageV2);
+
+        Assert.Equal(1, loader.Count());
+        Assert.True(loader.Contains(packageV1));
+        Assert.True(loader.Contains(packageV2));
+        Assert.Same(packageV1, loader.GetEquivalentPackage(packageV2));
+        Assert.Single(loader.GetEquivalentPackages(packageV1));
+    }
+
+    [Fact]
+    public async Task AddForeign_KeepsDistinctVersions_WhenVersionAwareIdentityIsEnabled()
+    {
+        var manager = new PackageManagerBuilder().Build();
+        var loader = new TestPackageLoader([manager], allowMultiplePackageVersions: true);
+        var packageV1 = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("1.0.0")
+            .Build();
+        var packageV2 = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("2.0.0")
+            .Build();
+
+        await loader.AddForeign(packageV1);
+        await loader.AddForeign(packageV2);
+
+        Assert.Equal(2, loader.Count());
+        Assert.Same(packageV1, loader.GetEquivalentPackage(packageV1));
+        Assert.Same(packageV2, loader.GetEquivalentPackage(packageV2));
+        Assert.Equal(
+            ["1.0.0", "2.0.0"],
+            loader.GetEquivalentPackages(packageV1).Select(package => package.VersionString).Order()
+        );
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task EquivalenceIgnoresTheSourceOnlyWhenInstalledPackagesDoNotKeepIt(
+        bool installedPackagesKeepTheirSource,
+        bool expectMatch
+    )
+    {
+        var manager = new PackageManagerBuilder()
+            .ConfigureCapabilities(capabilities =>
+            {
+                capabilities.InstalledPackagesKeepTheirSource = installedPackagesKeepTheirSource;
+                return capabilities;
+            })
+            .Build();
+        var loader = new TestPackageLoader([manager], allowMultiplePackageVersions: false);
+        var fromFirstFeed = new PackageBuilder()
+            .WithManager(manager)
+            .WithSource(new ManagerSource(manager, "first", new Uri("https://first.example.test/")))
+            .WithId("dotnetsay")
+            .WithVersion("1.0.0")
+            .Build();
+        var fromSecondFeed = new PackageBuilder()
+            .WithManager(manager)
+            .WithSource(new ManagerSource(manager, "second", new Uri("https://second.example.test/")))
+            .WithId("DotNetSay")
+            .WithVersion("2.0.0")
+            .Build();
+
+        await loader.AddForeign(fromFirstFeed);
+
+        Assert.Equal(expectMatch, loader.GetEquivalentPackage(fromSecondFeed) is not null);
+        Assert.Equal(expectMatch ? 1 : 0, loader.GetEquivalentPackages(fromSecondFeed).Count);
+        Assert.Equal(expectMatch, fromFirstFeed.IsSamePackageAs(fromSecondFeed));
+
+        loader.Remove(fromSecondFeed);
+        Assert.Equal(expectMatch ? 0 : 1, loader.Count());
+    }
+
+    [Theory]
+    [InlineData("1.0.0", true)]
+    [InlineData("2.0.0", false)]
+    public async Task AVersionAwareLoaderRemovesTheSameVersionFromAnotherFeed(
+        string removedVersion,
+        bool expectRemoved
+    )
+    {
+        var manager = new PackageManagerBuilder()
+            .ConfigureCapabilities(capabilities =>
+            {
+                capabilities.InstalledPackagesKeepTheirSource = false;
+                return capabilities;
+            })
+            .Build();
+        var loader = new TestPackageLoader([manager], allowMultiplePackageVersions: true);
+        await loader.AddForeign(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithSource(new ManagerSource(manager, "first", new Uri("https://first.example.test/")))
+                .WithId("dotnetsay")
+                .WithVersion("1.0.0")
+                .Build()
+        );
+
+        loader.Remove(
+            new PackageBuilder()
+                .WithManager(manager)
+                .WithSource(new ManagerSource(manager, "second", new Uri("https://second.example.test/")))
+                .WithId("dotnetsay")
+                .WithVersion(removedVersion)
+                .Build()
+        );
+
+        Assert.Equal(expectRemoved ? 0 : 1, loader.Count());
+    }
+
+    [Fact]
+    public async Task LookupAndRemovalApisUseLoaderIdentityAndSourceFiltering()
+    {
+        var manager = new PackageManagerBuilder()
+            .WithSources(testManager =>
+            [
+                new SourceBuilder()
+                    .WithManager(testManager)
+                    .WithName("stable")
+                    .WithUrl("https://example.test/stable")
+                    .Build(),
+                new SourceBuilder()
+                    .WithManager(testManager)
+                    .WithName("beta")
+                    .WithUrl("https://example.test/beta")
+                    .Build(),
+            ])
+            .Build();
+        var stableSource = manager.SourcesHelper.GetSources().Single(source => source.Name == "stable");
+        var betaSource = manager.SourcesHelper.GetSources().Single(source => source.Name == "beta");
+        var loader = new TestPackageLoader([manager]);
+        var uniquePackage = new PackageBuilder()
+            .WithManager(manager)
+            .WithSource(stableSource)
+            .WithId("Contoso.Unique")
+            .Build();
+        var stablePackage = new PackageBuilder()
+            .WithManager(manager)
+            .WithSource(stableSource)
+            .WithId("Contoso.Shared")
+            .Build();
+        var betaPackage = new PackageBuilder()
+            .WithManager(manager)
+            .WithSource(betaSource)
+            .WithId("Contoso.Shared")
+            .Build();
+        var recorder = new LoaderEventRecorder(loader);
+
+        await loader.AddForeign(uniquePackage);
+        await loader.AddForeign(stablePackage);
+        await loader.AddForeign(betaPackage);
+        loader.Remove(betaPackage);
+
+        Assert.True(loader.Contains(stablePackage));
+        Assert.False(loader.Contains(betaPackage));
+        Assert.Same(uniquePackage, loader.GetPackageForId("Contoso.Unique"));
+        Assert.Same(stablePackage, loader.GetPackageForId("Contoso.Shared", "stable"));
+        Assert.Null(loader.GetPackageForId("Contoso.Shared", "beta"));
+        Assert.Single(loader.GetEquivalentPackages(stablePackage));
+        Assert.Null(loader.GetEquivalentPackage(betaPackage));
+        Assert.Contains(recorder.RemovedPackages, package => package.Id == "Contoso.Shared");
+    }
+
+    [Fact]
+    public async Task ClearPackagesAndStopLoading_EmitExpectedEvents()
+    {
+        var manager = new PackageManagerBuilder().Build();
+        var loader = new TestPackageLoader([manager]);
+        var recorder = new LoaderEventRecorder(loader);
+        var package = new PackageBuilder().WithManager(manager).WithId("Contoso.Tool").Build();
+
+        await loader.AddForeign(package);
+        loader.StopLoading(emitFinishSignal: false);
+        loader.ClearPackages();
+
+        Assert.Equal(0, loader.Count());
+        Assert.Equal(1, recorder.FinishedLoadingCount);
+        Assert.Equal(2, recorder.Changes.Count);
+        Assert.False(recorder.Changes[1].ProceduralChange);
+        Assert.Empty(recorder.Changes[1].AddedPackages);
+        Assert.Empty(recorder.Changes[1].RemovedPackages);
+    }
+
+    [Fact]
+    public async Task ReloadPackages_ClearsExistingPackages_FiltersInvalidOnes_AndRaisesLifecycleEvents()
+    {
+        var manager = new PackageManagerBuilder()
+            .WithInstalledPackages(testManager =>
+            [
+                new PackageBuilder()
+                    .WithManager(testManager)
+                    .WithId("Contoso.Accepted")
+                    .WithVersion("1.0.0")
+                    .Build(),
+                new PackageBuilder()
+                    .WithManager(testManager)
+                    .WithId("Contoso.Accepted")
+                    .WithVersion("1.0.0")
+                    .Build(),
+                new PackageBuilder()
+                    .WithManager(testManager)
+                    .WithId("Contoso.Rejected")
+                    .WithVersion("1.0.0")
+                    .Build(),
+            ])
+            .Build();
+        var loader = new TestPackageLoader(
+            [manager],
+            loadPackages: testManager => testManager.GetInstalledPackages(),
+            isPackageValid: package => Task.FromResult(package.Id != "Contoso.Rejected")
+        );
+        var stalePackage = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Stale")
+            .WithVersion("0.9.0")
+            .Build();
+        var recorder = new LoaderEventRecorder(loader);
+
+        await loader.AddForeign(stalePackage);
+        await loader.ReloadPackages();
+
+        var changeEvents = recorder.Changes.Skip(1).ToArray();
+
+        Assert.True(recorder.StartedLoading);
+        Assert.True(recorder.FinishedLoading);
+        Assert.Equal(1, recorder.StartedLoadingCount);
+        Assert.Equal(1, recorder.FinishedLoadingCount);
+        Assert.True(loader.IsLoaded);
+        Assert.False(loader.IsLoading);
+        Assert.Equal(["Contoso.Accepted"], loader.Packages.Select(package => package.Id).Distinct());
+        Assert.Single(loader.Packages);
+        Assert.Equal(2, changeEvents.Length);
+        Assert.False(changeEvents[0].ProceduralChange);
+        Assert.Empty(changeEvents[0].AddedPackages);
+        Assert.True(changeEvents[1].ProceduralChange);
+        Assert.Equal(["Contoso.Accepted"], changeEvents[1].AddedPackages.Select(package => package.Id).Distinct());
+    }
+
+    [Fact]
+    public async Task ReloadPackages_KeepsTheCheckedStateOfPackagesAlreadyOnTheList()
+    {
+        var manager = new PackageManagerBuilder()
+            .WithInstalledPackages(testManager =>
+            [
+                new PackageBuilder()
+                    .WithManager(testManager)
+                    .WithId("Contoso.Kept")
+                    .WithVersion("1.0.0")
+                    .Build(),
+                new PackageBuilder()
+                    .WithManager(testManager)
+                    .WithId("Contoso.Untouched")
+                    .WithVersion("1.0.0")
+                    .Build(),
+            ])
+            .Build();
+        var loader = new TestPackageLoader([manager], checkedByDefault: true);
+
+        await loader.ReloadPackages();
+        loader.GetPackageForId("Contoso.Kept")!.IsChecked = false;
+        await loader.ReloadPackages();
+
+        Assert.False(loader.GetPackageForId("Contoso.Kept")!.IsChecked);
+        Assert.True(loader.GetPackageForId("Contoso.Untouched")!.IsChecked);
+    }
+
+    [Fact]
+    public async Task ReloadPackages_UnchecksAnUpdateThatNowNeedsAReinstall_ButKeepsAChosenOne()
+    {
+        bool requiresReinstall = false;
+        var manager = new PackageManagerBuilder()
+            .WithInstalledPackages(testManager =>
+            {
+                var builder = new PackageBuilder()
+                    .WithManager(testManager)
+                    .WithId("Contoso.Tool")
+                    .WithVersion("1.0.0")
+                    .WithNewVersion("2.0.0");
+                if (requiresReinstall)
+                    builder.RequiringReinstallToUpdate();
+                return [builder.Build()];
+            })
+            .Build();
+        var loader = new TestPackageLoader([manager], checkedByDefault: true);
+
+        await loader.ReloadPackages();
+        Assert.True(loader.GetPackageForId("Contoso.Tool")!.IsChecked);
+
+        requiresReinstall = true;
+        await loader.ReloadPackages();
+        Assert.False(loader.GetPackageForId("Contoso.Tool")!.IsChecked);
+
+        loader.GetPackageForId("Contoso.Tool")!.IsChecked = true;
+        await loader.ReloadPackages();
+        Assert.True(loader.GetPackageForId("Contoso.Tool")!.IsChecked);
+    }
+
+    [Fact]
+    public async Task ReloadPackages_AppliesTheDefaultCheckedState_ToPackagesThatWereNotOnTheList()
+    {
+        var ids = new List<string> { "Contoso.First" };
+        var manager = new PackageManagerBuilder()
+            .WithInstalledPackages(testManager => ids
+                .Select(id => new PackageBuilder()
+                    .WithManager(testManager)
+                    .WithId(id)
+                    .WithVersion("1.0.0")
+                    .Build())
+                .ToArray())
+            .Build();
+        var loader = new TestPackageLoader([manager], checkedByDefault: true);
+
+        await loader.ReloadPackages();
+        loader.GetPackageForId("Contoso.First")!.IsChecked = false;
+        ids.Add("Contoso.Second");
+        await loader.ReloadPackages();
+
+        Assert.False(loader.GetPackageForId("Contoso.First")!.IsChecked);
+        Assert.True(loader.GetPackageForId("Contoso.Second")!.IsChecked);
+    }
+
+    [Fact]
+    public async Task AddForeign_AppliesTheDefaultCheckedState_WhenAPreviousStateIsStillRemembered()
+    {
+        var ids = new List<string> { "Contoso.Tool" };
+        var manager = new PackageManagerBuilder()
+            .WithInstalledPackages(testManager => ids
+                .Select(id => new PackageBuilder()
+                    .WithManager(testManager)
+                    .WithId(id)
+                    .WithVersion("1.0.0")
+                    .Build())
+                .ToArray())
+            .Build();
+        var loader = new TestPackageLoader([manager], checkedByDefault: true);
+
+        await loader.ReloadPackages();
+        loader.GetPackageForId("Contoso.Tool")!.IsChecked = false;
+        ids.Clear();
+        await loader.ReloadPackages();
+
+        var readded = new PackageBuilder()
+            .WithManager(manager)
+            .WithId("Contoso.Tool")
+            .WithVersion("1.0.0")
+            .Build();
+        await loader.AddForeign(readded);
+
+        Assert.True(readded.IsChecked);
+    }
+
+    [Fact]
+    public async Task ReloadPackages_ReportsSettledLoadState_WhenFinishedLoadingIsRaised()
+    {
+        var manager = new PackageManagerBuilder().Build();
+        var loader = new TestPackageLoader([manager], loadPackages: _ => []);
+
+        bool? isLoadingWhenFinished = null;
+        bool? isLoadedWhenFinished = null;
+        loader.FinishedLoading += (_, _) =>
+        {
+            isLoadingWhenFinished = loader.IsLoading;
+            isLoadedWhenFinished = loader.IsLoaded;
+        };
+
+        await loader.ReloadPackages();
+
+        Assert.False(isLoadingWhenFinished);
+        Assert.True(isLoadedWhenFinished);
+    }
+
+    [Fact]
+    public async Task ReloadPackages_SettlesAndAnnouncesCompletion_WhenTheLoadFails()
+    {
+        var manager = new PackageManagerBuilder()
+            .WithInstalledPackages(testManager =>
+            [
+                new PackageBuilder()
+                    .WithManager(testManager)
+                    .WithId("Contoso.Tool")
+                    .WithVersion("1.0.0")
+                    .Build(),
+            ])
+            .Build();
+        TestPackageLoader? loaderReference = null;
+        Task? waitTakenDuringLoad = null;
+        var loader = new TestPackageLoader(
+            [manager],
+            isPackageValid: _ =>
+            {
+                waitTakenDuringLoad = loaderReference!.WaitForCurrentLoadAsync();
+                throw new InvalidOperationException("the load blew up");
+            }
+        );
+        loaderReference = loader;
+        var recorder = new LoaderEventRecorder(loader);
+
+        await loader.ReloadPackages();
+
+        Assert.Equal(1, recorder.FinishedLoadingCount);
+        Assert.False(loader.IsLoading);
+        Assert.True(loader.LastLoadReportedFailures);
+        Assert.False(loader.HasPendingInitialLoad);
+        Assert.NotNull(waitTakenDuringLoad);
+        Assert.True(waitTakenDuringLoad.IsCompleted);
+    }
+
+    [Fact]
+    public async Task ReloadPackages_AnnouncesCompletionOnce_WhenAFinishedLoadingSubscriberThrows()
+    {
+        var manager = new PackageManagerBuilder().Build();
+        var loader = new TestPackageLoader([manager], loadPackages: _ => []);
+        var recorder = new LoaderEventRecorder(loader);
+        loader.FinishedLoading += (_, _) => throw new InvalidOperationException("the subscriber blew up");
+
+        await loader.ReloadPackages();
+
+        Assert.Equal(1, recorder.FinishedLoadingCount);
+        Assert.True(loader.IsLoaded);
+        Assert.NotNull(loader.LastLoadFinishedUtc);
+        Assert.False(loader.LastLoadReportedFailures);
+    }
+
+    [Fact]
+    public async Task ReloadPackages_LeavesAQueuedReloadUntouched_WhenAFinishedLoadingSubscriberThrows()
+    {
+        using var release = new ManualResetEventSlim(true);
+        var manager = new PackageManagerBuilder().Build();
+        var loader = new TestPackageLoader(
+            [manager],
+            loadPackages: _ =>
+            {
+                release.Wait();
+                return [];
+            }
+        );
+
+        Task? queued = null;
+        loader.FinishedLoading += (_, _) =>
+        {
+            if (queued is not null) return;
+            release.Reset();
+            queued = loader.ReloadPackages();
+        };
+        loader.FinishedLoading += (_, _) => throw new InvalidOperationException("the subscriber blew up");
+
+        await loader.ReloadPackages();
+
+        Assert.NotNull(queued);
+        Assert.True(loader.IsLoading);
+        Assert.False(loader.LastLoadReportedFailures);
+
+        release.Set();
+        await queued;
+    }
+}

@@ -1,0 +1,12 @@
+{
+  "appName": "Upkeep",
+  "version": "1.0.0.0",
+  "publisher": "Upkeep",
+  "primaryExe": "Upkeep.exe",
+  "installLocation": "C:\\Program Files\\Upkeep",
+  "startMenuFolder": "Upkeep",
+  "desktopShortcut": true,
+  "startMenuShortcut": true,
+  "fileAssociations": [],
+  "pathEntry": false
+}

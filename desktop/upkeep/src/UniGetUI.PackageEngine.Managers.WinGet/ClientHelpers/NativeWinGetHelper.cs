@@ -1,0 +1,1311 @@
+using System.Collections.Concurrent;
+using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
+using Microsoft.Management.Deployment;
+using Microsoft.Win32;
+using UniGetUI.Core.Classes;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.SettingsEngine;
+using UniGetUI.Core.Tools;
+using UniGetUI.PackageEngine.Classes.Manager;
+using UniGetUI.PackageEngine.Enums;
+using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.ManagerClasses.Classes;
+using UniGetUI.PackageEngine.PackageClasses;
+using UniGetUI.PackageEngine.Structs;
+using WindowsPackageManager.Interop;
+
+namespace UniGetUI.PackageEngine.Managers.WingetManager;
+
+internal sealed class NativeWinGetHelper : IWinGetManagerHelper
+{
+    public WindowsPackageManagerFactory Factory = null!;
+    public static WindowsPackageManagerFactory? ExternalFactory;
+    public PackageManager WinGetManager = null!;
+    public static PackageManager? ExternalWinGetManager;
+    private readonly WinGet Manager;
+    private readonly Func<WinGet, IWinGetManagerHelper> _systemCliHelperFactory;
+    private readonly Func<IReadOnlyList<CatalogPackage>>? _localPackagesProvider;
+    private readonly IPingetPackageDetailsProvider _pingetPackageDetailsProvider;
+    private const string UserUninstallKeyPath =
+        @"Software\Microsoft\Windows\CurrentVersion\Uninstall";
+    private const string InstalledIndexInvalidationValueName = "UniGetUI.InstalledIndexInvalidation";
+    private int _activeLocalPackageQueries;
+    private ExceptionDispatchInfo? _lastActivationException;
+
+    public string ActivationMode { get; private set; } = string.Empty;
+    public string ActivationSource { get; private set; } = string.Empty;
+
+    internal static IReadOnlyList<string> PreferredActivationModes =>
+    [
+        "packaged COM registration",
+        "lower-trust COM registration",
+    ];
+
+    public NativeWinGetHelper(WinGet manager)
+        : this(
+            manager,
+            systemCliHelperFactory: null,
+            skipInitialization: false,
+            localPackagesProvider: null
+        )
+    { }
+
+    internal NativeWinGetHelper(
+        WinGet manager,
+        Func<WinGet, IWinGetManagerHelper>? systemCliHelperFactory,
+        bool skipInitialization,
+        Func<IReadOnlyList<CatalogPackage>>? localPackagesProvider,
+        IPingetPackageDetailsProvider? pingetPackageDetailsProvider = null
+    )
+    {
+        Manager = manager;
+        _systemCliHelperFactory =
+            systemCliHelperFactory
+            ?? (static manager => manager.CreateCliHelperForSelectedCliTool());
+        _localPackagesProvider = localPackagesProvider;
+        _pingetPackageDetailsProvider =
+            pingetPackageDetailsProvider ?? new PingetPackageDetailsProvider();
+        if (CoreTools.IsAdministrator())
+        {
+            Logger.Info(
+                "Running elevated, WinGet class registration is likely to fail unless using lower trust class registration is allowed in settings"
+            );
+        }
+
+        if (skipInitialization)
+        {
+            return;
+        }
+
+        if (TryInitializeStandardFactory())
+        {
+            return;
+        }
+
+        if (TryInitializeLowerTrustFactory())
+        {
+            return;
+        }
+
+        _lastActivationException?.Throw();
+
+        throw new InvalidOperationException("WinGet: Failed to initialize system COM activation.");
+    }
+
+    internal bool HasActiveLocalPackageQuery => Volatile.Read(ref _activeLocalPackageQueries) > 0;
+
+    internal void SetLocalPackageQueryInProgressForTesting(bool value)
+    {
+        Interlocked.Exchange(ref _activeLocalPackageQueries, value ? 1 : 0);
+    }
+
+    private bool TryInitializeLowerTrustFactory()
+    {
+        try
+        {
+            var factory = new WindowsPackageManagerStandardFactory(allowLowerTrustRegistration: true);
+            var winGetManager = factory.CreatePackageManager();
+            ApplyFactory(
+                factory,
+                winGetManager,
+                "lower-trust COM registration",
+                "system COM registration (allow lower trust)",
+                "Connected to WinGet API using lower-trust COM activation."
+            );
+            return true;
+        }
+        catch (WinGetComActivationException ex)
+        {
+            _lastActivationException = ExceptionDispatchInfo.Capture(ex);
+            Logger.Warn(
+                $"Lower-trust WinGet COM activation failed ({ex.HResultHex}: {ex.Reason})."
+            );
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _lastActivationException = ExceptionDispatchInfo.Capture(ex);
+            Logger.Warn(
+                $"Lower-trust WinGet COM activation failed ({ex.Message})."
+            );
+            return false;
+        }
+    }
+
+    private bool TryInitializeStandardFactory()
+    {
+        try
+        {
+            var factory = new WindowsPackageManagerStandardFactory();
+            var winGetManager = factory.CreatePackageManager();
+            ApplyFactory(
+                factory,
+                winGetManager,
+                "packaged COM registration",
+                "system COM registration",
+                "Connected to WinGet API using packaged COM activation."
+            );
+            return true;
+        }
+        catch (WinGetComActivationException ex)
+        {
+            _lastActivationException = ExceptionDispatchInfo.Capture(ex);
+            Logger.Warn(
+                $"Packaged WinGet COM activation failed ({ex.HResultHex}: {ex.Reason}), attempting lower-trust activation..."
+            );
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _lastActivationException = ExceptionDispatchInfo.Capture(ex);
+            Logger.Warn(
+                $"Packaged WinGet COM activation failed ({ex.Message}), attempting lower-trust activation..."
+            );
+            return false;
+        }
+    }
+
+    private void ApplyFactory(
+        WindowsPackageManagerFactory factory,
+        PackageManager winGetManager,
+        string activationMode,
+        string activationSource,
+        string successMessage
+    )
+    {
+        Factory = factory;
+        WinGetManager = winGetManager;
+        ActivationMode = activationMode;
+        ActivationSource = activationSource;
+        ExternalFactory = factory;
+        ExternalWinGetManager = winGetManager;
+
+        Logger.Info(successMessage);
+        Logger.Info($"WinGet activation mode selected: {ActivationMode} | Source: {ActivationSource}");
+    }
+
+    internal readonly record struct NativeSearchRequest(
+        PackageMatchField Field,
+        bool IsSelector,
+        uint? ResultLimit
+    );
+
+    internal static IReadOnlyList<NativeSearchRequest> GetSearchRequests(string query) =>
+        query.Length == 0
+            ? [new(PackageMatchField.CatalogDefault, true, (uint)SearchLimits.MaxEmptyQueryResultsPerSource)]
+            :
+            [
+                new(PackageMatchField.Name, false, null),
+                new(PackageMatchField.Id, false, null),
+                new(PackageMatchField.Moniker, false, null),
+            ];
+
+    internal readonly record struct NativeSearchMatchId(string CatalogName, string? Id);
+
+    internal readonly record struct NativeSearchResult(string Name, string Version);
+
+    internal static IReadOnlyList<int> SelectUniqueSearchMatches(
+        IReadOnlyList<NativeSearchMatchId> matches
+    )
+    {
+        List<int> selected = [];
+        HashSet<(string, string)> seen = [];
+        for (int index = 0; index < matches.Count; index++)
+        {
+            if (matches[index].Id is { } id && seen.Add((matches[index].CatalogName, id)))
+            {
+                selected.Add(index);
+            }
+        }
+
+        return selected;
+    }
+
+    internal sealed record ResolvedSearchMatch<TPackage>(
+        int FirstIndex,
+        string Id,
+        NativeSearchResult Result,
+        TPackage Package
+    );
+
+    internal sealed record SearchMatchResolution<TPackage>(
+        IReadOnlyList<ResolvedSearchMatch<TPackage>> Matches,
+        IReadOnlyList<Exception> Errors,
+        int ResultCount
+    );
+
+    internal static SearchMatchResolution<TPackage> ResolveSearchMatches<TPackage>(
+        IReadOnlyList<(string CatalogName, TPackage Package)> matches,
+        Func<TPackage, string> readId,
+        Func<TPackage, NativeSearchResult> readResult,
+        int parallelism,
+        CancellationToken cancellationToken
+    )
+    {
+        var ids = new NativeSearchMatchId[matches.Count];
+        var resolved = new NativeSearchResult?[matches.Count];
+        var errors = new Exception?[matches.Count];
+        ConcurrentDictionary<(string, string), int> resolvingIndex = new();
+        Parallel.For(
+            0,
+            matches.Count,
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = parallelism,
+                CancellationToken = cancellationToken,
+            },
+            index =>
+            {
+                var (catalogName, package) = matches[index];
+                try
+                {
+                    string id = readId(package);
+                    ids[index] = new(catalogName, id);
+                    if (resolvingIndex.TryAdd((catalogName, id), index))
+                    {
+                        resolved[index] = readResult(package);
+                    }
+                }
+                catch (Exception e)
+                {
+                    if (ids[index].Id is null)
+                    {
+                        ids[index] = new(catalogName, null);
+                    }
+
+                    errors[index] = e;
+                }
+            }
+        );
+
+        List<ResolvedSearchMatch<TPackage>> results = [];
+        foreach (int firstIndex in SelectUniqueSearchMatches(ids))
+        {
+            NativeSearchMatchId match = ids[firstIndex];
+            int index = resolvingIndex[(match.CatalogName, match.Id!)];
+            if (resolved[index] is { } result)
+            {
+                results.Add(new(firstIndex, match.Id!, result, matches[index].Package));
+            }
+        }
+
+        return new(
+            results,
+            [.. errors.OfType<Exception>()],
+            resolvingIndex.Count + ids.Count(match => match.Id is null)
+        );
+    }
+
+    public IReadOnlyList<Package> FindPackages_UnSafe(string query)
+    {
+        List<Package> packages = [];
+        INativeTaskLogger logger = Manager.TaskLogger.CreateNew(LoggableTaskType.FindPackages);
+        Dictionary<
+            (PackageCatalogReference, PackageMatchField),
+            Task<FindPackagesResult>
+        > FindPackageTasks = [];
+
+        // Load catalogs
+        logger.Log("Loading available catalogs...");
+        IReadOnlyList<PackageCatalogReference> AvailableCatalogs =
+            WinGetManager.GetPackageCatalogs();
+
+        // Spawn Tasks to find packages on catalogs
+        logger.Log("Spawning catalog fetching tasks...");
+        foreach (PackageCatalogReference CatalogReference in NativeWinGetCollection.Copy(AvailableCatalogs))
+        {
+            logger.Log($"Begin search on catalog {CatalogReference.Info.Name}");
+            // Connect to catalog
+            CatalogReference.AcceptSourceAgreements = true;
+            ConnectResult result = CatalogReference.Connect();
+            if (result.Status == ConnectResultStatus.Ok)
+            {
+                foreach (NativeSearchRequest request in GetSearchRequests(query))
+                {
+                    FindPackagesOptions PackageFilters = Factory.CreateFindPackagesOptions();
+
+                    logger.Log("Generating filters...");
+                    // Name filter
+                    PackageMatchFilter FilterName = Factory.CreatePackageMatchFilter();
+                    FilterName.Field = request.Field;
+                    FilterName.Value = query;
+                    FilterName.Option = PackageFieldMatchOption.ContainsCaseInsensitive;
+                    if (request.IsSelector)
+                    {
+                        PackageFilters.Selectors.Add(FilterName);
+                    }
+                    else
+                    {
+                        PackageFilters.Filters.Add(FilterName);
+                    }
+
+                    if (request.ResultLimit is { } limit)
+                    {
+                        PackageFilters.ResultLimit = limit;
+                    }
+
+                    try
+                    {
+                        // Create task and spawn it
+                        Task<FindPackagesResult> task = new(() =>
+                            result.PackageCatalog.FindPackages(PackageFilters)
+                        );
+                        task.Start();
+
+                        // Add task to list
+                        FindPackageTasks.Add((CatalogReference, request.Field), task);
+                    }
+                    catch (Exception e)
+                    {
+                        logger.Error(
+                            "WinGet: Catalog "
+                                + CatalogReference.Info.Name
+                                + " failed to spawn FindPackages task."
+                        );
+                        logger.Error(e);
+                    }
+                }
+            }
+            else
+            {
+                logger.Error(
+                    "WinGet: Catalog " + CatalogReference.Info.Name + " failed to connect."
+                );
+            }
+        }
+
+        // Wait for tasks completion
+        Task.WhenAll(FindPackageTasks.Values.ToArray()).GetAwaiter().GetResult();
+        logger.Log($"All catalogs fetched. Fetching results for query piece {query}");
+
+        List<(IManagerSource Source, CatalogPackage NativePackage)> matches = [];
+        foreach (var CatalogTaskPair in FindPackageTasks)
+        {
+            try
+            {
+                // Get the source for the catalog
+                IManagerSource source = Manager.SourcesHelper.Factory.GetSourceOrDefault(
+                    CatalogTaskPair.Key.Item1.Info.Name
+                );
+
+                FindPackagesResult FoundPackages = CatalogTaskPair.Value.Result;
+                foreach (
+                    MatchResult matchResult in NativeWinGetCollection.Copy(FoundPackages.Matches)
+                )
+                {
+                    matches.Add((source, matchResult.CatalogPackage));
+                }
+            }
+            catch (Exception e)
+            {
+                logger.Error(
+                    "WinGet: Catalog "
+                        + CatalogTaskPair.Key.Item1.Info.Name
+                        + " failed to get available packages."
+                );
+                logger.Error(e);
+            }
+        }
+
+        SearchMatchResolution<CatalogPackage> resolution;
+        try
+        {
+            resolution = ResolveSearchMatches(
+                [.. matches.Select(match => (match.Source.Name, match.NativePackage))],
+                nativePackage => nativePackage.Id,
+                nativePackage =>
+                    new(nativePackage.Name, nativePackage.DefaultInstallVersion.Version),
+                SearchVersionResolutionParallelism,
+                Manager.CurrentListingCancellation
+            );
+        }
+        catch (OperationCanceledException)
+        {
+            logger.Error("WinGet: The search was cancelled before its results were read.");
+            logger.Close(1);
+            throw;
+        }
+
+        if (resolution.Errors.Count > 0)
+        {
+            logger.Error(
+                $"WinGet: {resolution.Errors.Count} of {resolution.ResultCount} search results could not be read. First error:"
+            );
+            logger.Error(resolution.Errors[0]);
+        }
+
+        foreach (var match in resolution.Matches)
+        {
+            IManagerSource source = matches[match.FirstIndex].Source;
+            logger.Log(
+                $"Found package: {match.Result.Name}|{match.Id}|{match.Result.Version} on catalog {source.Name}"
+            );
+
+            var UniGetUIPackage = new Package(
+                match.Result.Name,
+                match.Id,
+                match.Result.Version,
+                source,
+                Manager,
+                new OverridenInstallationOptions()
+            );
+            NativePackageHandler.AddPackage(UniGetUIPackage, match.Package);
+            packages.Add(UniGetUIPackage);
+        }
+
+        logger.Close(packages.Count == 0 && resolution.Errors.Count > 0 ? 1 : 0);
+        return packages;
+    }
+
+    private const int SearchVersionResolutionParallelism = 8;
+
+    public IReadOnlyList<Package> GetAvailableUpdates_UnSafe()
+    {
+        var logger = Manager.TaskLogger.CreateNew(LoggableTaskType.ListUpdates);
+        IReadOnlyList<CatalogPackage> nativePackages;
+        try
+        {
+            nativePackages = GetCachedLocalWinGetPackages(15);
+        }
+        catch (Exception ex) when (ShouldFallbackToCli(ex))
+        {
+            return GetAvailableUpdatesFromSystemCli(ex);
+        }
+
+        List<Package> packages = [];
+        List<(CatalogPackage Package, PackageVersionInfo Newest)> reinstallCandidates = [];
+        Lazy<IReadOnlyList<InstalledEntry>> installedEntries = new(() => ReadInstalledEntries(nativePackages));
+        foreach (var nativePackage in nativePackages)
+        {
+            try
+            {
+                if (!nativePackage.IsUpdateAvailable)
+                {
+                    if (
+                        Manager.GetLauncherGameSource(nativePackage.InstalledVersion?.Id) is null
+                        && TryGetReinstallOnlyUpdate(nativePackage) is { } newest
+                    )
+                    {
+                        reinstallCandidates.Add((nativePackage, newest));
+                    }
+
+                    continue;
+                }
+
+                if (Manager.GetLauncherGameSource(nativePackage.InstalledVersion.Id) is { } launcherGameSource)
+                {
+                    logger.Log(
+                        $"Skipping the update of {nativePackage.Id}, since it was installed by {launcherGameSource.Name}"
+                    );
+                    continue;
+                }
+
+                if (nativePackage.DefaultInstallVersion is null)
+                {
+                    Logger.Warn(
+                        $"WinGet package {nativePackage.Id} has IsUpdateAvailable=true but DefaultInstallVersion is null, skipping"
+                    );
+                    continue;
+                }
+
+                if (nativePackage.DefaultInstallVersion.PackageCatalog?.Info is null)
+                {
+                    Logger.Warn(
+                        $"WinGet package {nativePackage.Id} has a DefaultInstallVersion with null PackageCatalog or Info, skipping"
+                    );
+                    continue;
+                }
+
+                if (
+                    IsSupersededByAnotherInstall(
+                        nativePackage,
+                        nativePackage.DefaultInstallVersion.Version,
+                        installedEntries.Value,
+                        logger
+                    )
+                )
+                {
+                    continue;
+                }
+
+                IManagerSource source;
+                source = Manager.SourcesHelper.Factory.GetSourceOrDefault(
+                    nativePackage.DefaultInstallVersion.PackageCatalog.Info.Name
+                );
+
+                string? reportedVersion = nativePackage.InstalledVersion.Version;
+                string version = WinGetPkgOperationHelper.ResolveReportedInstalledVersion(
+                    nativePackage.Id,
+                    reportedVersion
+                );
+
+                var UniGetUIPackage = new Package(
+                    nativePackage.Name,
+                    nativePackage.Id,
+                    version,
+                    nativePackage.DefaultInstallVersion.Version,
+                    source,
+                    Manager
+                )
+                {
+                    InstalledVersionIsUnverified = WinGetPkgOperationHelper.IsUnknownVersion(
+                        reportedVersion
+                    ),
+                };
+
+                // Suppress an update that repeatedly fails to stick (#5158); the COM path still avoids
+                // the one-shot "already upgraded" cache (#5042).
+                if (WinGetPkgOperationHelper.IsStuckUpgradeLoop(UniGetUIPackage))
+                    continue;
+
+                NativePackageHandler.AddPackage(UniGetUIPackage, nativePackage);
+                NativePackageHandler.AddLocalIdentifier(
+                    UniGetUIPackage,
+                    nativePackage.InstalledVersion?.Id
+                );
+                packages.Add(UniGetUIPackage);
+                logger.Log(
+                    $"Found package {nativePackage.Name} {nativePackage.Id} on source {source.Name}, from version {version} to version {nativePackage.DefaultInstallVersion.Version}"
+                );
+            }
+            catch (Exception ex)
+            {
+                LogSkippedPackage(logger, nativePackage, "listing available updates", ex);
+            }
+        }
+
+        AddReinstallOnlyUpdates(
+            [
+                .. reinstallCandidates.Where(candidate =>
+                    !IsSupersededByAnotherInstall(
+                        candidate.Package,
+                        candidate.Newest.Version,
+                        installedEntries.Value,
+                        logger
+                    )
+                ),
+            ],
+            packages,
+            logger
+        );
+
+        logger.Close(0);
+        return packages;
+    }
+
+    internal readonly record struct InstalledEntry(string DisplayName, string Publisher, string Version);
+
+    private static IReadOnlyList<InstalledEntry> ReadInstalledEntries(
+        IReadOnlyList<CatalogPackage> nativePackages
+    )
+    {
+        List<InstalledEntry> entries = [];
+        foreach (var nativePackage in nativePackages)
+        {
+            if (ReadInstalledEntry(nativePackage) is { } entry)
+                entries.Add(entry);
+        }
+
+        return entries;
+    }
+
+    private static InstalledEntry? ReadInstalledEntry(CatalogPackage nativePackage)
+    {
+        try
+        {
+            return nativePackage.InstalledVersion is { } installed
+                ? new InstalledEntry(
+                    installed.DisplayName ?? "",
+                    installed.Publisher ?? "",
+                    installed.Version ?? ""
+                )
+                : null;
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(
+                $"Could not read the installed entry of {DescribePackage(nativePackage)}: {ex.Message}"
+            );
+            return null;
+        }
+    }
+
+    private bool IsSupersededByAnotherInstall(
+        CatalogPackage nativePackage,
+        string? newVersion,
+        IReadOnlyList<InstalledEntry> installedEntries,
+        INativeTaskLogger logger
+    )
+    {
+        if (
+            ReadInstalledEntry(nativePackage) is not { } candidate
+            || FindInstallAtOrAbove(Manager, candidate, newVersion, installedEntries) is not { } newer
+        )
+        {
+            return false;
+        }
+
+        logger.Log(
+            $"Skipping the update of {DescribePackage(nativePackage)} from {candidate.Version} to {newVersion}, "
+                + $"since {newer.DisplayName} {newer.Version} from {newer.Publisher} is already installed"
+        );
+        return true;
+    }
+
+    internal static InstalledEntry? FindInstallAtOrAbove(
+        IPackageManager manager,
+        InstalledEntry candidate,
+        string? newVersion,
+        IEnumerable<InstalledEntry> installedEntries
+    )
+    {
+        if (
+            string.IsNullOrWhiteSpace(candidate.DisplayName)
+            || string.IsNullOrWhiteSpace(candidate.Publisher)
+            || WinGetPkgOperationHelper.IsUnknownVersion(newVersion)
+        )
+        {
+            return null;
+        }
+
+        foreach (var entry in installedEntries)
+        {
+            if (
+                string.Equals(entry.DisplayName, candidate.DisplayName, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(entry.Publisher, candidate.Publisher, StringComparison.OrdinalIgnoreCase)
+                && !WinGetPkgOperationHelper.IsUnknownVersion(entry.Version)
+                && manager.CompareVersions(entry.Version, newVersion!) is >= 0
+            )
+            {
+                return entry;
+            }
+        }
+
+        return null;
+    }
+
+    private PackageVersionInfo? TryGetReinstallOnlyUpdate(CatalogPackage nativePackage)
+    {
+        try
+        {
+            PackageVersionInfo? installed = nativePackage.InstalledVersion;
+            var availableVersions = nativePackage.AvailableVersions;
+            if (installed is null || availableVersions is null)
+                return null;
+
+            string installedChannel = installed.Channel ?? "";
+            PackageVersionId? newestId = null;
+            for (int i = 0; i < availableVersions.Count; i++)
+            {
+                if (string.Equals(availableVersions[i].Channel ?? "", installedChannel, StringComparison.OrdinalIgnoreCase))
+                {
+                    newestId = availableVersions[i];
+                    break;
+                }
+            }
+
+            if (newestId is null || !IsNewerVersion(Manager, installed.Version, newestId.Version))
+                return null;
+
+            PackageVersionInfo newest = nativePackage.GetPackageVersionInfo(newestId);
+            if (newest?.PackageCatalog?.Info is null)
+                return null;
+
+            return newest.GetApplicableInstaller(Factory.CreateInstallOptions()) is null ? null : newest;
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(
+                $"Could not check whether {DescribePackage(nativePackage)} has an update that needs a reinstall: {ex.Message}"
+            );
+            return null;
+        }
+    }
+
+    private static IEnumerable<string?> GetPinIdentifiers(CatalogPackage nativePackage)
+    {
+        yield return nativePackage.Id;
+        if (nativePackage.InstalledVersion is not { } installed)
+            yield break;
+
+        yield return installed.Id;
+        foreach (string productCode in NativeWinGetCollection.Copy(installed.ProductCodes))
+            yield return productCode;
+        foreach (string familyName in NativeWinGetCollection.Copy(installed.PackageFamilyNames))
+            yield return familyName;
+    }
+
+    internal static bool IsNewerVersion(IPackageManager manager, string? installedVersion, string? newestVersion) =>
+        !WinGetPkgOperationHelper.IsUnknownVersion(installedVersion)
+        && !string.IsNullOrWhiteSpace(newestVersion)
+        && manager.CompareVersions(installedVersion!, newestVersion) is < 0;
+
+    private void AddReinstallOnlyUpdates(
+        List<(CatalogPackage Package, PackageVersionInfo Newest)> candidates,
+        List<Package> packages,
+        INativeTaskLogger logger
+    )
+    {
+        if (candidates.Count == 0)
+            return;
+
+        if (Settings.Get(Settings.K.UseAgentBroker))
+        {
+            logger.Log(
+                "Updates that need a reinstall are not listed while operations go through the Devolutions Agent"
+            );
+            return;
+        }
+
+        IReadOnlyList<string>? pinnedIds = WinGetPins.Read(Manager);
+        if (pinnedIds is null)
+        {
+            logger.Error(
+                "Could not read the WinGet pins, so updates that need a reinstall are not listed"
+            );
+            return;
+        }
+
+        foreach (var (nativePackage, newest) in candidates)
+        {
+            try
+            {
+                if (WinGetPins.IsPinned(pinnedIds, GetPinIdentifiers(nativePackage)))
+                    continue;
+
+                IManagerSource source = Manager.SourcesHelper.Factory.GetSourceOrDefault(
+                    newest.PackageCatalog.Info.Name
+                );
+                string? reportedVersion = nativePackage.InstalledVersion.Version;
+                var package = new Package(
+                    nativePackage.Name,
+                    nativePackage.Id,
+                    WinGetPkgOperationHelper.ResolveReportedInstalledVersion(
+                        nativePackage.Id,
+                        reportedVersion
+                    ),
+                    newest.Version,
+                    source,
+                    Manager
+                )
+                {
+                    InstalledVersionIsUnverified = WinGetPkgOperationHelper.IsUnknownVersion(
+                        reportedVersion
+                    ),
+                    RequiresReinstallToUpdate = true,
+                };
+
+                if (WinGetPkgOperationHelper.IsStuckUpgradeLoop(package))
+                    continue;
+
+                NativePackageHandler.AddPackage(package, nativePackage);
+                NativePackageHandler.AddLocalIdentifier(package, nativePackage.InstalledVersion?.Id);
+                packages.Add(package);
+                logger.Log(
+                    $"Found package {nativePackage.Name} {nativePackage.Id} on source {source.Name}, from version {package.VersionString} to version {newest.Version}, which needs a reinstall"
+                );
+            }
+            catch (Exception ex)
+            {
+                LogSkippedPackage(logger, nativePackage, "listing updates that need a reinstall", ex);
+            }
+        }
+    }
+
+    public IReadOnlyList<Package> GetInstalledPackages_UnSafe()
+    {
+        var logger = Manager.TaskLogger.CreateNew(LoggableTaskType.ListInstalledPackages);
+        IReadOnlyList<CatalogPackage> nativePackages;
+        try
+        {
+            nativePackages = GetCachedLocalWinGetPackages(15);
+        }
+        catch (Exception ex) when (ShouldFallbackToCli(ex))
+        {
+            return GetInstalledPackagesFromSystemCli(ex);
+        }
+
+        List<Package> packages = [];
+        foreach (var nativePackage in nativePackages)
+        {
+            try
+            {
+                string id = nativePackage.Id;
+                string? localIdentifier = nativePackage.InstalledVersion.Id;
+                IManagerSource source;
+                var availableVersions =
+                    nativePackage.AvailableVersions is { } versions
+                        ? NativeWinGetCollection.Copy(versions)
+                        : [];
+                if (Manager.GetLauncherGameSource(localIdentifier) is { } launcherGameSource)
+                {
+                    id = localIdentifier!;
+                    source = launcherGameSource;
+                }
+                else if (availableVersions.Length > 0)
+                {
+                    var installPackage = nativePackage.GetPackageVersionInfo(availableVersions[0]);
+                    source = Manager.SourcesHelper.Factory.GetSourceOrDefault(
+                        installPackage.PackageCatalog.Info.Name
+                    );
+                }
+                else
+                {
+                    source = Manager.GetLocalSource(nativePackage.Id);
+                }
+
+                string? reportedVersion = nativePackage.InstalledVersion.Version;
+                string version = WinGetPkgOperationHelper.ResolveReportedInstalledVersion(
+                    id,
+                    reportedVersion
+                );
+
+                logger.Log(
+                    $"Found package {nativePackage.Name} {id} on source {source.Name}"
+                );
+                var UniGetUIPackage = new Package(
+                    nativePackage.Name,
+                    id,
+                    version,
+                    source,
+                    Manager
+                )
+                {
+                    InstalledVersionIsUnverified = WinGetPkgOperationHelper.IsUnknownVersion(
+                        reportedVersion
+                    ),
+                };
+                NativePackageHandler.AddPackage(UniGetUIPackage, nativePackage);
+                NativePackageHandler.AddLocalIdentifier(
+                    UniGetUIPackage,
+                    nativePackage.InstalledVersion?.Id
+                );
+                packages.Add(UniGetUIPackage);
+            }
+            catch (Exception ex)
+            {
+                LogSkippedPackage(logger, nativePackage, "listing installed packages", ex);
+            }
+        }
+        logger.Close(0);
+        return packages;
+    }
+
+    private IReadOnlyList<CatalogPackage> GetCachedLocalWinGetPackages(int? cacheSeconds = null)
+    {
+        (long, long) generations = (
+            WinGet.SourceIndexGeneration,
+            Manager.InstalledPackagesGeneration
+        );
+
+        return cacheSeconds is null
+            ? TaskRecycler<IReadOnlyList<CatalogPackage>>.RunOrAttach(
+                EnumerateLocalWinGetPackages,
+                generations
+            )
+            : TaskRecycler<IReadOnlyList<CatalogPackage>>.RunOrAttach(
+                EnumerateLocalWinGetPackages,
+                generations,
+                cacheSeconds.Value
+            );
+    }
+
+    private IReadOnlyList<CatalogPackage> EnumerateLocalWinGetPackages((long, long) generations)
+    {
+        return _localPackagesProvider is not null
+            ? _localPackagesProvider()
+            : GetLocalWinGetPackages();
+    }
+
+    private IReadOnlyList<Package> GetAvailableUpdatesFromSystemCli(Exception ex)
+    {
+        var unwrappedException = UnwrapException(ex);
+        Logger.Warn(
+            $"Native WinGet update enumeration failed with {unwrappedException.GetType().Name}: {unwrappedException.Message}. Falling back to system WinGet CLI."
+        );
+        return _systemCliHelperFactory(Manager).GetAvailableUpdates_UnSafe();
+    }
+
+    private IReadOnlyList<Package> GetInstalledPackagesFromSystemCli(Exception ex)
+    {
+        var unwrappedException = UnwrapException(ex);
+        Logger.Warn(
+            $"Native WinGet installed-package enumeration failed with {unwrappedException.GetType().Name}: {unwrappedException.Message}. Falling back to system WinGet CLI."
+        );
+        return _systemCliHelperFactory(Manager).GetInstalledPackages_UnSafe();
+    }
+
+    private static bool ShouldFallbackToCli(Exception ex)
+    {
+        var unwrappedException = UnwrapException(ex);
+
+        // Native COM/SEH exceptions from the WinGet COM server or its interop layer
+        if (unwrappedException is SEHException or COMException or AccessViolationException)
+        {
+            return true;
+        }
+
+        return
+            unwrappedException is InvalidOperationException
+            && string.Equals(
+                unwrappedException.Message,
+                "WinGet: Failed to connect to composite catalog.",
+                StringComparison.Ordinal
+            );
+    }
+
+    private static Exception UnwrapException(Exception ex)
+    {
+        while (ex is AggregateException aggregateException && aggregateException.InnerException is not null)
+        {
+            ex = aggregateException.InnerException;
+        }
+
+        return ex;
+    }
+
+    private static void LogSkippedPackage(
+        INativeTaskLogger logger,
+        CatalogPackage nativePackage,
+        string operation,
+        Exception ex
+    )
+    {
+        string packageDescription = DescribePackage(nativePackage);
+        logger.Error($"Skipping WinGet package while {operation}: {packageDescription}");
+        logger.Error(ex);
+        Logger.Warn(
+            $"Skipping WinGet package while {operation}: {packageDescription}. {ex.GetType().Name}: {ex.Message}"
+        );
+    }
+
+    private static string DescribePackage(CatalogPackage nativePackage)
+    {
+        try
+        {
+            string id = nativePackage.Id;
+            if (!string.IsNullOrWhiteSpace(id))
+            {
+                return id;
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            string name = nativePackage.Name;
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                return name;
+            }
+        }
+        catch
+        {
+        }
+
+        return "<unknown package>";
+    }
+
+    private IReadOnlyList<CatalogPackage> GetLocalWinGetPackages()
+    {
+        Interlocked.Increment(ref _activeLocalPackageQueries);
+        var logger = Manager.TaskLogger.CreateNew(LoggableTaskType.OtherTask);
+        try
+        {
+            logger.Log("OtherTask: GetWinGetLocalPackages");
+            InvalidateInstalledIndexCache(logger);
+            var availableCatalogs = GetReachableLocalCatalogReferences(logger);
+            PackageCatalogReference installedSearchCatalogRef = CreateLocalCompositeCatalog(
+                availableCatalogs,
+                logger
+            );
+
+            var ConnectResult = installedSearchCatalogRef.Connect();
+            if (ConnectResult.Status != ConnectResultStatus.Ok)
+            {
+                logger.Error("Failed to connect to installedSearchCatalogRef. Aborting.");
+                logger.Close(1);
+                throw new InvalidOperationException("WinGet: Failed to connect to composite catalog.");
+            }
+
+            FindPackagesOptions findPackagesOptions = Factory.CreateFindPackagesOptions();
+            PackageMatchFilter filter = Factory.CreatePackageMatchFilter();
+            filter.Field = PackageMatchField.Id;
+            filter.Option = PackageFieldMatchOption.StartsWithCaseInsensitive;
+            filter.Value = "";
+            findPackagesOptions.Filters.Add(filter);
+
+            FindPackagesResult TaskResult;
+            try
+            {
+                TaskResult = ConnectResult.PackageCatalog.FindPackages(findPackagesOptions);
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"FindPackages native call failed: {ex.GetType().Name}: {ex.Message}");
+                logger.Close(1);
+                throw new InvalidOperationException("WinGet: Failed to connect to composite catalog.", ex);
+            }
+
+            List<CatalogPackage> foundPackages = [];
+            foreach (var match in NativeWinGetCollection.Copy(TaskResult.Matches))
+            {
+                foundPackages.Add(match.CatalogPackage);
+            }
+
+            logger.Close(0);
+            return foundPackages;
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeLocalPackageQueries);
+        }
+    }
+
+    private static void InvalidateInstalledIndexCache(INativeTaskLogger logger)
+    {
+        try
+        {
+            using RegistryKey? uninstallKey = Registry.CurrentUser.OpenSubKey(
+                UserUninstallKeyPath,
+                writable: true
+            );
+            if (uninstallKey is null)
+            {
+                logger.Log("No per-user uninstall key found; skipping WinGet installed index invalidation");
+                return;
+            }
+
+            uninstallKey.SetValue(InstalledIndexInvalidationValueName, Environment.ProcessId);
+            uninstallKey.DeleteValue(InstalledIndexInvalidationValueName, throwOnMissingValue: false);
+        }
+        catch (Exception ex)
+        {
+            logger.Error($"Could not invalidate the WinGet installed index: {ex.Message}");
+            Logger.Warn($"Could not invalidate the WinGet installed index: {ex.Message}");
+        }
+    }
+
+    private IReadOnlyList<PackageCatalogReference> GetReachableLocalCatalogReferences(
+        INativeTaskLogger logger
+    )
+    {
+        return SelectReachableCatalogs(
+            NativeWinGetCollection.Copy(WinGetManager.GetPackageCatalogs()),
+            static catalogRef => catalogRef.Info.Name,
+            catalogRef => TryConnectLocalCatalog(catalogRef, logger),
+            catalogName =>
+            {
+                logger.Log($"Catalog {catalogName} is reachable for local package enumeration");
+            },
+            catalogName =>
+            {
+                string message =
+                    $"Skipping unavailable WinGet catalog {catalogName} while loading local packages";
+                logger.Error(message);
+                Logger.Warn(message);
+            }
+        );
+    }
+
+    internal static IReadOnlyList<TCatalog> SelectReachableCatalogs<TCatalog>(
+        IEnumerable<TCatalog> catalogs,
+        Func<TCatalog, string> describeCatalog,
+        Func<TCatalog, bool> isReachable,
+        Action<string>? onReachable = null,
+        Action<string>? onSkipped = null
+    )
+    {
+        List<TCatalog> reachableCatalogs = [];
+        foreach (var catalog in catalogs)
+        {
+            string catalogName = describeCatalog(catalog);
+            if (isReachable(catalog))
+            {
+                onReachable?.Invoke(catalogName);
+                reachableCatalogs.Add(catalog);
+            }
+            else
+            {
+                onSkipped?.Invoke(catalogName);
+            }
+        }
+
+        if (reachableCatalogs.Count == 0)
+        {
+            throw new InvalidOperationException("WinGet: Failed to connect to composite catalog.");
+        }
+
+        return reachableCatalogs;
+    }
+
+    private bool TryConnectLocalCatalog(PackageCatalogReference catalogRef, INativeTaskLogger logger)
+    {
+        var localCatalogRef = CreateLocalCompositeCatalog([catalogRef], logger);
+        var connectResult = localCatalogRef.Connect();
+        if (connectResult.Status == ConnectResultStatus.Ok)
+        {
+            return true;
+        }
+
+        logger.Error(
+            $"WinGet: Catalog {catalogRef.Info.Name} failed local catalog connection with status {connectResult.Status}."
+        );
+        return false;
+    }
+
+    private PackageCatalogReference CreateLocalCompositeCatalog(
+        IEnumerable<PackageCatalogReference> catalogs,
+        INativeTaskLogger logger
+    )
+    {
+        CreateCompositePackageCatalogOptions createCompositePackageCatalogOptions =
+            Factory.CreateCreateCompositePackageCatalogOptions();
+        foreach (var catalogRef in catalogs)
+        {
+            catalogRef.AcceptSourceAgreements = true;
+            logger.Log($"Adding catalog {catalogRef.Info.Name} to composite catalog");
+            createCompositePackageCatalogOptions.Catalogs.Add(catalogRef);
+        }
+
+        createCompositePackageCatalogOptions.CompositeSearchBehavior =
+            CompositeSearchBehavior.LocalCatalogs;
+        return WinGetManager.CreateCompositePackageCatalog(createCompositePackageCatalogOptions);
+    }
+
+    public IReadOnlyList<IManagerSource> GetSources_UnSafe()
+    {
+        List<ManagerSource> sources = [];
+        INativeTaskLogger logger = Manager.TaskLogger.CreateNew(LoggableTaskType.ListSources);
+
+        foreach (
+            PackageCatalogReference catalog in NativeWinGetCollection.Copy(
+                WinGetManager.GetPackageCatalogs()
+            )
+        )
+        {
+            try
+            {
+                logger.Log(
+                    $"Found source {catalog.Info.Name} with argument {catalog.Info.Argument}"
+                );
+                sources.Add(
+                    new ManagerSource(
+                        Manager,
+                        catalog.Info.Name,
+                        new Uri(catalog.Info.Argument),
+                        updateDate: (
+                            catalog.Info.LastUpdateTime.Second != 0
+                                ? catalog.Info.LastUpdateTime
+                                : DateTime.Now
+                        ).ToString()
+                    )
+                );
+            }
+            catch (Exception e)
+            {
+                logger.Error(e);
+            }
+        }
+
+        logger.Close(0);
+        return sources;
+    }
+
+    public IReadOnlyList<string> GetInstallableVersions_Unsafe(IPackage package)
+    {
+        INativeTaskLogger logger = Manager.TaskLogger.CreateNew(
+            LoggableTaskType.LoadPackageVersions
+        );
+
+        var nativePackage = NativePackageHandler.GetPackage(package);
+        if (nativePackage is null)
+            return [];
+
+        var nativeVersions = NativeWinGetCollection.Copy(nativePackage.AvailableVersions);
+        string[] versions = new string[nativeVersions.Length];
+        for (int index = 0; index < nativeVersions.Length; index++)
+        {
+            versions[index] = nativeVersions[index].Version;
+        }
+        foreach (string? version in versions)
+        {
+            logger.Log(version);
+        }
+
+        logger.Close(0);
+        return versions ?? [];
+    }
+
+    public void GetPackageDetails_UnSafe(IPackageDetails details)
+    {
+        INativeTaskLogger logger = Manager.TaskLogger.CreateNew(
+            LoggableTaskType.LoadPackageDetails
+        );
+
+        if (details.Package.Source.Name == "winget")
+        {
+            details.ManifestUrl = new Uri(
+                "https://github.com/microsoft/winget-pkgs/tree/master/manifests/"
+                    + details.Package.Id[0].ToString().ToLowerInvariant()
+                    + "/"
+                    + details.Package.Id.Split('.')[0]
+                    + "/"
+                    + string.Join(
+                        "/",
+                        details.Package.Id.Contains('.')
+                            ? details.Package.Id.Split('.')[1..]
+                            : details.Package.Id.Split('.')
+                    )
+            );
+        }
+        else if (details.Package.Source.Name == "msstore")
+        {
+            details.ManifestUrl = new Uri(
+                "https://apps.microsoft.com/detail/" + details.Package.Id
+            );
+        }
+
+        CatalogPackageMetadata? NativeDetails = NativePackageHandler.GetDetails(details.Package);
+        if (NativeDetails is null)
+        {
+            logger.Close(1);
+            return;
+        }
+
+        // Extract data from NativeDetails
+        if (NativeDetails.Author != "")
+            details.Author = NativeDetails.Author;
+
+        if (NativeDetails.Description != "")
+            details.Description = NativeDetails.Description;
+
+        if (NativeDetails.PackageUrl != "")
+            details.HomepageUrl = new Uri(NativeDetails.PackageUrl);
+
+        if (NativeDetails.License != "")
+            details.License = NativeDetails.License;
+
+        if (NativeDetails.LicenseUrl != "")
+            details.LicenseUrl = new Uri(NativeDetails.LicenseUrl);
+
+        if (NativeDetails.Publisher != "")
+            details.Publisher = NativeDetails.Publisher;
+
+        if (NativeDetails.ReleaseNotes != "")
+            details.ReleaseNotes = NativeDetails.ReleaseNotes;
+
+        if (NativeDetails.ReleaseNotesUrl != "")
+            details.ReleaseNotesUrl = new Uri(NativeDetails.ReleaseNotesUrl);
+
+        if (NativeDetails.Tags is not null)
+            details.Tags = NativeWinGetCollection.Copy(NativeDetails.Tags);
+
+        bool metadataLoaded = _pingetPackageDetailsProvider.LoadPackageDetails(details, logger);
+
+        logger.Close(metadataLoaded ? 0 : 1);
+    }
+}

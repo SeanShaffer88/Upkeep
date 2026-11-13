@@ -1,0 +1,1210 @@
+using System.Collections;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Globalization;
+using System.Net.Http;
+using Avalonia;
+using Avalonia.Collections;
+using Avalonia.Media.Imaging;
+using Avalonia.Threading;
+using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Avalonia.ViewModels.Pages;
+using UniGetUI.Avalonia.Views.Controls;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.SettingsEngine;
+using UniGetUI.Core.Tools;
+using UniGetUI.Interface.Enums;
+using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.ManagerClasses.Manager;
+using UniGetUI.PackageEngine.Managers.PipManager;
+#if WINDOWS
+using UniGetUI.PackageEngine.Managers.ScoopManager;
+using UniGetUI.PackageEngine.Managers.WingetManager;
+#endif
+
+// ReSharper disable once CheckNamespace
+namespace UniGetUI.PackageEngine.PackageClasses;
+
+/// <summary>
+/// Avalonia-compatible package wrapper (replaces the WinUI PackageWrapper that uses Microsoft.UI.Xaml).
+/// </summary>
+public sealed class PackageWrapper : INotifyPropertyChanged, IDisposable, IPackageIconHost
+{
+    private static readonly HttpClient _iconHttpClient = new(CoreTools.GenericHttpClientParameters)
+    {
+        Timeout = TimeSpan.FromSeconds(8),
+    };
+    private static readonly SemaphoreSlim _iconLoadSemaphore = new(8, 8);
+    private static readonly object _inflightIconLoadsLock = new();
+    private static readonly Dictionary<long, Task<Bitmap?>> _inflightIconLoads = new();
+
+    // Cap decoded icon size; the list shows icons at ≤64px (128 covers 2x DPI).
+    private const int MaxIconSide = 128;
+    private const int MaxIconDownloadBytes = 2 * 1024 * 1024;
+
+    // Bounded LRU by package hash. Evicted entries aren't disposed: a visible row may still
+    // reference the bitmap, so dropping it here only makes it GC-eligible.
+    private const int MaxIconCacheEntries = 512;
+    private static readonly object _iconCacheLock = new();
+    private static readonly Dictionary<long, LinkedListNode<(long Hash, Bitmap Bitmap)>> _iconCache = new();
+    private static readonly LinkedList<(long Hash, Bitmap Bitmap)> _iconCacheOrder = new();
+    private static readonly Dictionary<long, long> _failedIcons = new();
+    private const int MaxFailedIconEntries = 512;
+    private static readonly TimeSpan IconRetryInterval = TimeSpan.FromMinutes(5);
+
+    private const string UnknownInstallerHost = "\u2014";
+    private const int MaxInstallerHostCacheEntries = 1024;
+    private const int MaxUnresolvedInstallerHostEntries = 512;
+    private static readonly TimeSpan InstallerHostRetryInterval = TimeSpan.FromMinutes(5);
+    private static readonly SemaphoreSlim _installerHostSemaphore = new(4, 4);
+    private static readonly object _installerHostCacheLock = new();
+    private static readonly Dictionary<long, (string Host, string Urls)> _installerHostCache = new();
+    private static readonly Dictionary<long, long> _unresolvedInstallerHosts = new();
+
+    private const string UnknownDownloadSize = "\u2014";
+    private const int MaxDownloadSizeCacheEntries = 1024;
+    private static readonly TimeSpan DownloadSizeRetryInterval = TimeSpan.FromMinutes(5);
+    private static readonly SemaphoreSlim _downloadSizeSemaphore = new(8, 8);
+    private static readonly object _downloadSizeCacheLock = new();
+    private static readonly Dictionary<long, (long Size, long ResolvedAt)> _downloadSizeCache = new();
+
+    private const string UnknownReleaseDate = "\u2014";
+    private const int MaxReleaseDateCacheEntries = 1024;
+    private static readonly TimeSpan ReleaseDateRetryInterval = TimeSpan.FromMinutes(5);
+    private static readonly SemaphoreSlim _releaseDateSemaphore = new(8, 8);
+    private static readonly object _releaseDateCacheLock = new();
+    private static readonly Dictionary<long, (DateTime Date, long ResolvedAt)> _releaseDateCache = new();
+
+    private static Bitmap? GetCachedIcon(long hash)
+    {
+        lock (_iconCacheLock)
+        {
+            if (_iconCache.TryGetValue(hash, out var node))
+            {
+                _iconCacheOrder.Remove(node);
+                _iconCacheOrder.AddFirst(node);
+                return node.Value.Bitmap;
+            }
+        }
+        return null;
+    }
+
+    private static bool HasRecentIconFailure(long hash)
+    {
+        lock (_iconCacheLock)
+        {
+            if (!_failedIcons.TryGetValue(hash, out long failedAt))
+                return false;
+
+            if (Environment.TickCount64 - failedAt < (long)IconRetryInterval.TotalMilliseconds)
+                return true;
+
+            _failedIcons.Remove(hash);
+            return false;
+        }
+    }
+
+    private static void MarkIconFailed(long hash)
+    {
+        lock (_iconCacheLock)
+        {
+            _failedIcons[hash] = Environment.TickCount64;
+            if (_failedIcons.Count > MaxFailedIconEntries)
+                TrimFailedIcons();
+        }
+    }
+
+    private static void TrimFailedIcons()
+    {
+        long now = Environment.TickCount64;
+        long retryMs = (long)IconRetryInterval.TotalMilliseconds;
+        foreach (var expired in _failedIcons.Where(e => now - e.Value >= retryMs).ToArray())
+            _failedIcons.Remove(expired.Key);
+
+        int excess = _failedIcons.Count - MaxFailedIconEntries;
+        if (excess <= 0)
+            return;
+
+        foreach (var oldest in _failedIcons.OrderBy(e => e.Value).Take(excess).ToArray())
+            _failedIcons.Remove(oldest.Key);
+    }
+
+    private static void CacheIcon(long hash, Bitmap bitmap)
+    {
+        lock (_iconCacheLock)
+        {
+            _failedIcons.Remove(hash);
+
+            if (_iconCache.TryGetValue(hash, out var existing))
+            {
+                existing.Value = (hash, bitmap);
+                _iconCacheOrder.Remove(existing);
+                _iconCacheOrder.AddFirst(existing);
+                return;
+            }
+
+            var node = new LinkedListNode<(long, Bitmap)>((hash, bitmap));
+            _iconCache[hash] = node;
+            _iconCacheOrder.AddFirst(node);
+
+            while (_iconCache.Count > MaxIconCacheEntries && _iconCacheOrder.Last is { } last)
+            {
+                _iconCacheOrder.RemoveLast();
+                _iconCache.Remove(last.Value.Hash);
+            }
+        }
+    }
+
+    public static void ClearIconCache()
+    {
+        lock (_iconCacheLock)
+        {
+            _iconCache.Clear();
+            _iconCacheOrder.Clear();
+            _failedIcons.Clear();
+        }
+    }
+
+    public IPackage Package { get; }
+    public PackageWrapper Self => this;
+    public int Index { get; set; }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private readonly PackagesPageViewModel _page;
+
+    private Bitmap? _iconBitmap;
+    public Bitmap? IconBitmap
+    {
+        get => _iconBitmap;
+        private set
+        {
+            _iconBitmap = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IconBitmap)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasCustomIcon)));
+        }
+    }
+    public bool HasCustomIcon => _iconBitmap is not null;
+
+    public bool IsChecked
+    {
+        get => Package.IsChecked;
+        set
+        {
+            Package.IsChecked = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsChecked)));
+            _page.UpdatePackageCount();
+        }
+    }
+
+    public string VersionComboString { get; }
+    public string CardVersionString { get; }
+    public string ListedNameTooltip { get; private set; } = "";
+    public float ListedOpacity { get; private set; } = 1.0f;
+    public string TagBackdropIconPath { get; private set; } = "";
+    public string TagSymbolIconPath { get; private set; } = "";
+    public bool TagIconVisible { get; private set; }
+
+    public bool InstallerHostChanged { get; private set; }
+    public string InstallerHostChangeTooltip { get; private set; } = "";
+
+    public bool RequiresReinstallToUpdate => Package.RequiresReinstallToUpdate;
+    public bool ShowsNewVersionIcon => !InstallerHostChanged && !RequiresReinstallToUpdate;
+    public bool ShowsReinstallIcon => RequiresReinstallToUpdate && !InstallerHostChanged;
+    public string? ReinstallTooltip { get; }
+
+    public bool InstalledVersionIsUnverified => Package.InstalledVersionIsUnverified;
+    public string? InstalledVersionTooltip { get; private set; }
+
+    public string InstallerHostText { get; private set; } = "";
+    public string? InstallerHostTooltip { get; private set; }
+
+    public string VersionAutomationName =>
+        InstalledVersionIsUnverified && InstalledVersionTooltip is { } notice
+            ? $"{VersionComboString}, {notice}"
+            : VersionComboString;
+
+    public string NewVersionAutomationName =>
+        WithInstallerHostWarning(
+            ReinstallTooltip is { } reinstall
+                ? $"{Package.NewVersionString}, {reinstall}"
+                : Package.NewVersionString
+        );
+
+    public string InstallerHostAutomationName =>
+        WithInstallerHostWarning(InstallerHostText);
+
+    private string WithInstallerHostWarning(string value) =>
+        InstallerHostChanged ? $"{value}, {InstallerHostChangeTooltip}" : value;
+
+    public string DownloadSizeText { get; private set; } = "";
+    public long DownloadSizeBytes { get; private set; }
+
+    public string ReleaseDateText { get; private set; } = "";
+    public DateTime ReleaseDate { get; private set; }
+
+    private CancellationTokenSource? _installerHostCheckCts;
+    // Cancels this row's queued/in-flight icon load on disposal so it stops rooting the wrapper.
+    private readonly CancellationTokenSource _lifetimeCts = new();
+
+    public string SourceIconPath => IconTypeToSvgPath(Package.Source.IconId);
+
+    private static string IconTypeToSvgPath(IconType icon)
+    {
+        string name = icon switch
+        {
+            IconType.Chocolatey => "choco",
+            IconType.MsStore => "ms_store",
+            IconType.LocalPc => "local_pc",
+            IconType.SaveAs => "save_as",
+            IconType.SysTray => "sys_tray",
+            IconType.ClipboardList => "clipboard_list",
+            IconType.OpenFolder => "open_folder",
+            IconType.AddTo => "add_to",
+            _ => icon.ToString().ToLowerInvariant(),
+        };
+        return $"avares://UniGetUI/Assets/Symbols/{name}.svg";
+    }
+
+    public PackageWrapper(IPackage package, PackagesPageViewModel page)
+    {
+        Package = package;
+        _page = page;
+        VersionComboString = package.VersionString;
+        CardVersionString = package.IsUpgradable
+            && !string.IsNullOrWhiteSpace(package.NewVersionString)
+            && package.NewVersionString != package.VersionString
+            ? $"{package.VersionString} → {package.NewVersionString}"
+            : package.VersionString;
+        InstalledVersionTooltip = InstalledVersionNotice.BuildTooltip(package);
+        ReinstallTooltip = package.RequiresReinstallToUpdate
+            ? CoreTools.Translate(
+                "This version is installed differently from the one you have, so updating it uninstalls the current version first. Automatic updates and Update all leave it out unless \"Uninstall, then reinstall when updated\" is turned on for this package."
+            )
+            : null;
+
+        Package.PropertyChanged += Package_PropertyChanged;
+        UpdateDisplayState();
+
+        // Icons are normally preloaded after the result set completes. The visible-row hook remains
+        // as a fallback while results are still arriving.
+        MaybeStartInstallerHostCheck();
+    }
+
+    private readonly object _iconLoadLock = new();
+    private Task? _iconLoadTask;
+
+    /// <summary>Loads this row's icon at most once; also called when the row becomes visible.</summary>
+    public void EnsureIconLoaded()
+    {
+        _ = EnsureIconLoadedAsync();
+    }
+
+    public static Task<Bitmap?> LoadSharedIconAsync(IPackage package)
+    {
+        if (Settings.Get(Settings.K.DisableIconsOnPackageLists))
+            return Task.FromResult<Bitmap?>(null);
+
+        return GetSharedIconLoad(package.GetHash(), package);
+    }
+
+    /// <summary>Loads this row's icon at most once and returns the shared load operation.</summary>
+    public Task EnsureIconLoadedAsync()
+    {
+        if (Settings.Get(Settings.K.DisableIconsOnPackageLists)) return Task.CompletedTask;
+        lock (_iconLoadLock)
+            return _iconLoadTask ??= LoadIconAsync();
+    }
+
+    private int _installerHostLoadStarted;
+
+    public void EnsureInstallerHostLoaded()
+    {
+        if (!_page.InstallerHostColumnVisible) return;
+        if (Interlocked.Exchange(ref _installerHostLoadStarted, 1) != 0) return;
+        _ = LoadInstallerHostAsync();
+    }
+
+    private string TargetInstallerVersion =>
+        Package.IsUpgradable ? Package.NewVersionString : Package.VersionString;
+
+    private IPackage? _targetPackage;
+
+    // Some managers (Cargo, NuGet) read details for the package's own version, the installed one on update rows.
+    // The copy stays upgradable so update-only installer preferences (WinGet architecture) still apply.
+    private IPackage TargetPackage
+    {
+        get
+        {
+            if (_targetPackage is { } target) return target;
+            IPackage created = Package.IsUpgradable && Package.NewVersionString != Package.VersionString
+                ? new Package(Package.Name, Package.Id, Package.NewVersionString, Package.NewVersionString,
+                    Package.Source, Package.Manager, Package.OverridenOptions)
+                : Package;
+            return Interlocked.CompareExchange(ref _targetPackage, created, null) ?? created;
+        }
+    }
+
+    private async Task LoadInstallerHostAsync()
+    {
+        CancellationToken token = _lifetimeCts.Token;
+        long hash = CoreTools.HashStringAsLong(
+            $"{Package.GetVersionedHash()}|{TargetInstallerVersion}"
+        );
+        try
+        {
+            if (TryGetCachedInstallerHost(hash, out var cached))
+            {
+                ApplyInstallerHost(cached.Host, cached.Urls);
+                return;
+            }
+
+            if (HasRecentInstallerHostFailure(hash))
+            {
+                ApplyInstallerHost("", "");
+                return;
+            }
+
+            await _installerHostSemaphore.WaitAsync(token).ConfigureAwait(false);
+            (string Host, string Urls) resolved;
+            try
+            {
+                if (!TryGetCachedInstallerHost(hash, out resolved))
+                {
+                    IReadOnlyList<string>? urls = await ResolveInstallerUrlsAsync(token)
+                        .ConfigureAwait(false);
+                    resolved = (
+                        InstallerHostDisplay.FromUrls(urls),
+                        InstallerHostDisplay.JoinUrls(urls)
+                    );
+                    if (resolved.Host.Length > 0)
+                        CacheInstallerHost(hash, resolved.Host, resolved.Urls);
+                    else
+                        MarkInstallerHostUnresolved(hash);
+                }
+            }
+            finally
+            {
+                _installerHostSemaphore.Release();
+            }
+
+            if (token.IsCancellationRequested) return;
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                if (!token.IsCancellationRequested)
+                    ApplyInstallerHost(resolved.Host, resolved.Urls);
+            });
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Could not resolve the installer host for {Package.Id}: {ex.Message}");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _installerHostLoadStarted, 0);
+        }
+    }
+
+    private async Task<IReadOnlyList<string>?> ResolveInstallerUrlsAsync(CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+#if WINDOWS
+        if (Package.Manager is WinGet)
+        {
+            string version = TargetInstallerVersion;
+            return await Task.Run(() => WinGet.TryGetInstallerUrls(Package, version), token)
+                .ConfigureAwait(false);
+        }
+#endif
+        if (!Package.Details.IsPopulated)
+            await Package.Details.Load().ConfigureAwait(false);
+
+        return Package.Details.InstallerUrl is { } url ? [url.ToString()] : null;
+    }
+
+    private void ApplyInstallerHost(string host, string urls)
+    {
+        InstallerHostText = host.Length > 0 ? host : UnknownInstallerHost;
+        InstallerHostTooltip = urls.Length > 0 ? urls : null;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(InstallerHostText)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(InstallerHostTooltip)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(InstallerHostAutomationName)));
+    }
+
+    private static bool TryGetCachedInstallerHost(long hash, out (string Host, string Urls) entry)
+    {
+        lock (_installerHostCacheLock)
+            return _installerHostCache.TryGetValue(hash, out entry);
+    }
+
+    private static bool HasRecentInstallerHostFailure(long hash)
+    {
+        lock (_installerHostCacheLock)
+        {
+            if (!_unresolvedInstallerHosts.TryGetValue(hash, out long failedAt))
+                return false;
+
+            if (Environment.TickCount64 - failedAt < (long)InstallerHostRetryInterval.TotalMilliseconds)
+                return true;
+
+            _unresolvedInstallerHosts.Remove(hash);
+            return false;
+        }
+    }
+
+    private static void MarkInstallerHostUnresolved(long hash)
+    {
+        lock (_installerHostCacheLock)
+        {
+            long now = Environment.TickCount64;
+            _unresolvedInstallerHosts[hash] = now;
+            if (_unresolvedInstallerHosts.Count <= MaxUnresolvedInstallerHostEntries)
+                return;
+
+            long retryMs = (long)InstallerHostRetryInterval.TotalMilliseconds;
+            foreach (var expired in _unresolvedInstallerHosts.Where(e => now - e.Value >= retryMs).ToArray())
+                _unresolvedInstallerHosts.Remove(expired.Key);
+
+            int excess = _unresolvedInstallerHosts.Count - MaxUnresolvedInstallerHostEntries;
+            if (excess <= 0)
+                return;
+
+            foreach (var oldest in _unresolvedInstallerHosts.OrderBy(e => e.Value).Take(excess).ToArray())
+                _unresolvedInstallerHosts.Remove(oldest.Key);
+        }
+    }
+
+    private static void CacheInstallerHost(long hash, string host, string urls)
+    {
+        lock (_installerHostCacheLock)
+        {
+            if (_installerHostCache.Count >= MaxInstallerHostCacheEntries
+                && !_installerHostCache.ContainsKey(hash))
+            {
+                _installerHostCache.Clear();
+            }
+
+            _installerHostCache[hash] = (host, urls);
+        }
+    }
+
+    private readonly object _downloadSizeLoadLock = new();
+    private Task? _downloadSizeLoadTask;
+
+    private bool ManagerReportsDownloadSize
+    {
+        get
+        {
+            if (Package.Manager is Pip) return true;
+#if WINDOWS
+            if (Package.Manager is WinGet or Scoop) return true;
+#endif
+            return false;
+        }
+    }
+
+    public void EnsureDownloadSizeLoaded() => _ = EnsureDownloadSizeLoadedAsync();
+
+    public Task EnsureDownloadSizeLoadedAsync()
+    {
+        if (!_page.DownloadSizeColumnVisible) return Task.CompletedTask;
+
+        if (!ManagerReportsDownloadSize)
+        {
+            if (DownloadSizeText.Length == 0) ApplyDownloadSize(0);
+            return Task.CompletedTask;
+        }
+
+        lock (_downloadSizeLoadLock)
+        {
+            if (_downloadSizeLoadTask is { IsCompleted: false }) return _downloadSizeLoadTask;
+            return _downloadSizeLoadTask = LoadDownloadSizeAsync();
+        }
+    }
+
+    private async Task LoadDownloadSizeAsync()
+    {
+        CancellationToken token = _lifetimeCts.Token;
+        long hash = CoreTools.HashStringAsLong(
+            $"{Package.GetVersionedHash()}|{TargetInstallerVersion}"
+        );
+        try
+        {
+            if (TryGetCachedDownloadSize(hash, out long cached))
+            {
+                ApplyDownloadSize(cached);
+                return;
+            }
+
+            await _downloadSizeSemaphore.WaitAsync(token).ConfigureAwait(false);
+            long size;
+            try
+            {
+                if (!TryGetCachedDownloadSize(hash, out size))
+                {
+                    size = await ResolveDownloadSizeAsync(token).ConfigureAwait(false);
+                    CacheDownloadSize(hash, size);
+                }
+            }
+            finally
+            {
+                _downloadSizeSemaphore.Release();
+            }
+
+            if (token.IsCancellationRequested) return;
+            ApplyDownloadSize(size);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Could not resolve the download size for {Package.Id}: {ex.Message}");
+        }
+    }
+
+    private async Task<long> ResolveDownloadSizeAsync(CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        IPackageDetails details = TargetPackage.Details;
+        if (!details.IsPopulated)
+            await details.Load().ConfigureAwait(false);
+
+        token.ThrowIfCancellationRequested();
+        return details.InstallerSize;
+    }
+
+    private void ApplyDownloadSize(long size)
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(() => ApplyDownloadSize(size));
+            return;
+        }
+
+        DownloadSizeBytes = size;
+        DownloadSizeText = size > 0 ? CoreTools.FormatAsSize(size) : UnknownDownloadSize;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DownloadSizeBytes)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DownloadSizeText)));
+    }
+
+    private static bool TryGetCachedDownloadSize(long hash, out long size)
+    {
+        lock (_downloadSizeCacheLock)
+        {
+            size = 0;
+            if (!_downloadSizeCache.TryGetValue(hash, out var entry))
+                return false;
+
+            if (entry.Size > 0)
+            {
+                size = entry.Size;
+                return true;
+            }
+
+            if (Environment.TickCount64 - entry.ResolvedAt < (long)DownloadSizeRetryInterval.TotalMilliseconds)
+                return true;
+
+            _downloadSizeCache.Remove(hash);
+            return false;
+        }
+    }
+
+    private static void CacheDownloadSize(long hash, long size)
+    {
+        lock (_downloadSizeCacheLock)
+        {
+            if (_downloadSizeCache.Count >= MaxDownloadSizeCacheEntries
+                && !_downloadSizeCache.ContainsKey(hash))
+            {
+                _downloadSizeCache.Clear();
+            }
+
+            _downloadSizeCache[hash] = (size, Environment.TickCount64);
+        }
+    }
+
+    private readonly object _releaseDateLoadLock = new();
+    private Task? _releaseDateLoadTask;
+
+    public void EnsureReleaseDateLoaded() => _ = EnsureReleaseDateLoadedAsync();
+
+    public Task EnsureReleaseDateLoadedAsync()
+    {
+        if (!_page.ReleaseDateColumnVisible) return Task.CompletedTask;
+
+        if (Package.Manager.Capabilities.KnowsPackageReleaseDate is PackageReleaseDateSupport.No)
+        {
+            if (ReleaseDateText.Length == 0) ApplyReleaseDate(default);
+            return Task.CompletedTask;
+        }
+
+        lock (_releaseDateLoadLock)
+        {
+            if (_releaseDateLoadTask is { IsCompleted: false }) return _releaseDateLoadTask;
+            return _releaseDateLoadTask = LoadReleaseDateAsync();
+        }
+    }
+
+    private async Task LoadReleaseDateAsync()
+    {
+        CancellationToken token = _lifetimeCts.Token;
+        long hash = CoreTools.HashStringAsLong(
+            $"{Package.GetVersionedHash()}|{TargetInstallerVersion}"
+        );
+        try
+        {
+            if (TryGetCachedReleaseDate(hash, out DateTime cached))
+            {
+                ApplyReleaseDate(cached);
+                return;
+            }
+
+            await _releaseDateSemaphore.WaitAsync(token).ConfigureAwait(false);
+            DateTime date;
+            try
+            {
+                if (!TryGetCachedReleaseDate(hash, out date))
+                {
+                    date = await ResolveReleaseDateAsync(token).ConfigureAwait(false);
+                    CacheReleaseDate(hash, date);
+                }
+            }
+            finally
+            {
+                _releaseDateSemaphore.Release();
+            }
+
+            if (token.IsCancellationRequested) return;
+            ApplyReleaseDate(date);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Could not resolve the release date for {Package.Id}: {ex.Message}");
+        }
+    }
+
+    private async Task<DateTime> ResolveReleaseDateAsync(CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        IPackageDetails details = TargetPackage.Details;
+        if (!details.IsPopulated)
+            await details.Load().ConfigureAwait(false);
+
+        token.ThrowIfCancellationRequested();
+        // Timestamps carrying an offset become local time; bare dates are kept as published
+        return DateTime.TryParse(details.UpdateDate, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime date)
+            ? date
+            : default;
+    }
+
+    private void ApplyReleaseDate(DateTime date)
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(() => ApplyReleaseDate(date));
+            return;
+        }
+
+        ReleaseDate = date;
+        ReleaseDateText = date != default ? date.ToString("d", CultureInfo.CurrentCulture) : UnknownReleaseDate;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ReleaseDate)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ReleaseDateText)));
+    }
+
+    private static bool TryGetCachedReleaseDate(long hash, out DateTime date)
+    {
+        lock (_releaseDateCacheLock)
+        {
+            date = default;
+            if (!_releaseDateCache.TryGetValue(hash, out var entry))
+                return false;
+
+            if (entry.Date != default)
+            {
+                date = entry.Date;
+                return true;
+            }
+
+            if (Environment.TickCount64 - entry.ResolvedAt < (long)ReleaseDateRetryInterval.TotalMilliseconds)
+                return true;
+
+            _releaseDateCache.Remove(hash);
+            return false;
+        }
+    }
+
+    private static void CacheReleaseDate(long hash, DateTime date)
+    {
+        lock (_releaseDateCacheLock)
+        {
+            if (_releaseDateCache.Count >= MaxReleaseDateCacheEntries
+                && !_releaseDateCache.ContainsKey(hash))
+            {
+                _releaseDateCache.Clear();
+            }
+
+            _releaseDateCache[hash] = (date, Environment.TickCount64);
+        }
+    }
+
+    /// <summary>
+    /// For upgradable WinGet packages, asynchronously fetches the installer URL host for
+    /// both the installed and the new version, and flags the row when the hosts differ.
+    /// See issue #4617 — defense-in-depth signal that an upgrade may be redirecting the
+    /// download to a different domain than the user originally trusted.
+    /// </summary>
+    private void MaybeStartInstallerHostCheck()
+    {
+#if WINDOWS
+        if (!Package.IsUpgradable) return;
+        if (Package.Manager is not WinGet) return;
+        if (Settings.Get(Settings.K.DisableInstallerHostChangeWarning)) return;
+
+        string installedVersion = Package.VersionString;
+        string newVersion = Package.NewVersionString;
+        if (string.IsNullOrWhiteSpace(installedVersion) || string.IsNullOrWhiteSpace(newVersion))
+            return;
+        if (installedVersion == newVersion) return;
+
+        _installerHostCheckCts?.Cancel();
+        _installerHostCheckCts = new CancellationTokenSource();
+        CancellationToken token = _installerHostCheckCts.Token;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                if (token.IsCancellationRequested) return;
+                var oldHosts = WinGet.TryGetInstallerHostsForVersion(Package, installedVersion);
+                if (token.IsCancellationRequested) return;
+                var newHosts = WinGet.TryGetInstallerHostsForVersion(Package, newVersion);
+                if (token.IsCancellationRequested) return;
+
+                if (oldHosts is null || newHosts is null) return;
+                // Only flag when the two host sets are fully disjoint. If they share even
+                // one host, the publisher hasn't moved hosting — adding/removing CDN mirrors
+                // or architectures shouldn't trigger the warning.
+                if (oldHosts.Overlaps(newHosts)) return;
+                if (WinGet.InstallerHostsAreTrusted(Package, newHosts)) return;
+
+                string tooltip = CoreTools.Translate(
+                    "Installer host changed since the installed version.\n"
+                    + "Old: {0}\n"
+                    + "New: {1}\n\n"
+                    + "This is usually harmless (the publisher moved hosting), "
+                    + "but can also indicate a hijacked package manifest. "
+                    + "Verify the new source before upgrading.",
+                    string.Join(", ", oldHosts),
+                    string.Join(", ", newHosts)
+                );
+
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    if (token.IsCancellationRequested) return;
+                    InstallerHostChanged = true;
+                    InstallerHostChangeTooltip = tooltip;
+                    PropertyChanged?.Invoke(
+                        this,
+                        new PropertyChangedEventArgs(nameof(InstallerHostChanged))
+                    );
+                    PropertyChanged?.Invoke(
+                        this,
+                        new PropertyChangedEventArgs(nameof(InstallerHostChangeTooltip))
+                    );
+                    PropertyChanged?.Invoke(
+                        this,
+                        new PropertyChangedEventArgs(nameof(ShowsNewVersionIcon))
+                    );
+                    PropertyChanged?.Invoke(
+                        this,
+                        new PropertyChangedEventArgs(nameof(ShowsReinstallIcon))
+                    );
+                    PropertyChanged?.Invoke(
+                        this,
+                        new PropertyChangedEventArgs(nameof(NewVersionAutomationName))
+                    );
+                    PropertyChanged?.Invoke(
+                        this,
+                        new PropertyChangedEventArgs(nameof(InstallerHostAutomationName))
+                    );
+                });
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"Installer-host check failed for {Package.Id}: {ex.Message}");
+            }
+        }, token);
+#endif
+    }
+
+    private async Task LoadIconAsync()
+    {
+        CancellationToken token = _lifetimeCts.Token;
+        long hash = Package.GetHash();
+        if (GetCachedIcon(hash) is { } cached)
+        {
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                if (!token.IsCancellationRequested) IconBitmap = cached;
+            });
+            return;
+        }
+
+        if (HasRecentIconFailure(hash)) return;
+
+        try
+        {
+            Bitmap? bitmap = await GetSharedIconLoad(hash, Package).WaitAsync(token).ConfigureAwait(false);
+            if (bitmap is null) return;
+
+            if (token.IsCancellationRequested) return;
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                if (!token.IsCancellationRequested) IconBitmap = bitmap;
+            });
+        }
+        catch (OperationCanceledException) { /* row discarded before its icon finished loading */ }
+        catch { MarkIconFailed(hash); }
+    }
+
+    private static Task<Bitmap?> GetSharedIconLoad(long hash, IPackage package)
+    {
+        lock (_inflightIconLoadsLock)
+        {
+            if (GetCachedIcon(hash) is { } cached)
+                return Task.FromResult<Bitmap?>(cached);
+            if (HasRecentIconFailure(hash))
+                return Task.FromResult<Bitmap?>(null);
+            if (_inflightIconLoads.TryGetValue(hash, out Task<Bitmap?>? existing))
+                return existing;
+
+            Task<Bitmap?> task = LoadAndCacheIconAsync(hash, package);
+            _inflightIconLoads[hash] = task;
+            _ = RemoveInflightIconLoadAsync(hash, task);
+            return task;
+        }
+    }
+
+    private static async Task RemoveInflightIconLoadAsync(long hash, Task<Bitmap?> task)
+    {
+        try { await task.ConfigureAwait(false); }
+        finally
+        {
+            lock (_inflightIconLoadsLock)
+            {
+                if (_inflightIconLoads.TryGetValue(hash, out Task<Bitmap?>? current)
+                    && ReferenceEquals(current, task))
+                    _inflightIconLoads.Remove(hash);
+            }
+        }
+    }
+
+    private static async Task<Bitmap?> LoadAndCacheIconAsync(long hash, IPackage package)
+    {
+        await _iconLoadSemaphore.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var uri = await Task.Run(package.GetIconUrlIfAny).ConfigureAwait(false);
+            if (uri is null) { MarkIconFailed(hash); return null; }
+
+            Bitmap? decoded;
+            if (uri.IsFile)
+            {
+                if (IsKnownUndecodableExtension(uri.LocalPath))
+                {
+                    MarkIconFailed(hash);
+                    return null;
+                }
+                decoded = await Task.Run(() => TryDecodeIcon(uri.LocalPath)).ConfigureAwait(false);
+            }
+            else if (uri.Scheme is "http" or "https")
+            {
+                using var response = await _iconHttpClient.GetAsync(
+                    uri,
+                    HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
+                response.EnsureSuccessStatusCode();
+                if (response.Content.Headers.ContentLength > MaxIconDownloadBytes)
+                {
+                    MarkIconFailed(hash);
+                    return null;
+                }
+
+                await response.Content.LoadIntoBufferAsync(MaxIconDownloadBytes).ConfigureAwait(false);
+                var bytes = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+                decoded = TryDecodeIcon(bytes, uri.Host);
+            }
+            else { MarkIconFailed(hash); return null; }
+
+            if (decoded is null)
+            {
+                MarkIconFailed(hash);
+                return null;
+            }
+
+            CacheIcon(hash, decoded);
+            return decoded;
+        }
+        catch
+        {
+            MarkIconFailed(hash);
+            return null;
+        }
+        finally
+        {
+            _iconLoadSemaphore.Release();
+        }
+    }
+
+    // Icons come from a shared on-disk cache that can hold empty or partial entries after an
+    // interrupted download; decoding those throws. Skip those entries instead of failing the row.
+    private static Bitmap? TryDecodeIcon(string filePath)
+    {
+        var info = new FileInfo(filePath);
+        if (!info.Exists || info.Length == 0) return null;
+        return TryDecodeIcon(() => { using var ms = BitmapLoader.ReadFile(filePath); return DecodeDownscaled(ms); }, filePath);
+    }
+
+    private static Bitmap? TryDecodeIcon(byte[] bytes, string source)
+        => bytes.Length == 0 ? null : TryDecodeIcon(() => { using var ms = new MemoryStream(bytes); return DecodeDownscaled(ms); }, source);
+
+    private static Bitmap? TryDecodeIcon(Func<Bitmap> decode, string source)
+    {
+        try { return decode(); }
+        catch (Exception ex) { Logger.Warn($"Discarding undecodable icon '{source}': {ex.Message}"); return null; }
+    }
+
+    // Decode directly at the display-cache width. This avoids allocating a full-size bitmap first,
+    // which is important for untrusted or unusually large package artwork.
+    private static Bitmap DecodeDownscaled(Stream stream)
+        => Bitmap.DecodeToWidth(stream, MaxIconSide, BitmapInterpolationMode.HighQuality);
+
+    private static bool IsKnownUndecodableExtension(string path)
+    {
+        string ext = Path.GetExtension(path);
+        return ext.Equals(".svg", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".tif", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".tiff", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".avif", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void Package_PropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(Package.Tag))
+        {
+            UpdateDisplayState();
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ListedOpacity)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ListedNameTooltip)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(TagBackdropIconPath)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(TagSymbolIconPath)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(TagIconVisible)));
+        }
+        else if (e.PropertyName == nameof(Package.IsChecked))
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsChecked)));
+        }
+        else
+        {
+            PropertyChanged?.Invoke(this, e);
+        }
+    }
+
+    private void UpdateDisplayState()
+    {
+        ListedOpacity = Package.Tag switch
+        {
+            PackageTag.OnQueue or PackageTag.BeingProcessed or PackageTag.Unavailable => 0.5f,
+            _ => 1.0f,
+        };
+        ListedNameTooltip = Package.Name;
+
+        // Match WinUI: an accent-coloured filled disc with the symbol punched out, then the
+        // symbol drawn on top in the default foreground. OnQueue/Unavailable show no badge.
+        (string symbol, string backdrop) = Package.Tag switch
+        {
+            PackageTag.AlreadyInstalled => ("installed", "installed_filled"),
+            PackageTag.IsUpgradable => ("upgradable", "upgradable_filled"),
+            PackageTag.Pinned => ("pin", "pin_filled"),
+            PackageTag.BeingProcessed => ("loading", "loading_filled"),
+            PackageTag.Failed => ("warning", "warning_filled"),
+            _ => ("", ""),
+        };
+        TagIconVisible = symbol.Length > 0;
+        TagSymbolIconPath = TagIconVisible ? $"avares://UniGetUI/Assets/Symbols/{symbol}.svg" : "";
+        TagBackdropIconPath = TagIconVisible ? $"avares://UniGetUI/Assets/Symbols/{backdrop}.svg" : "";
+    }
+
+    public void Dispose()
+    {
+        Package.PropertyChanged -= Package_PropertyChanged;
+        _installerHostCheckCts?.Cancel();
+        _installerHostCheckCts?.Dispose();
+        _installerHostCheckCts = null;
+        _lifetimeCts.Cancel(); // not disposed: a background load may still hold the token
+    }
+}
+
+/// <summary>
+/// Avalonia-compatible observable collection of PackageWrapper with sorting support
+/// (replaces WinUI's ObservablePackageCollection that used SortableObservableCollection).
+/// </summary>
+public sealed class ObservablePackageCollection : AvaloniaList<PackageWrapper>
+{
+    public enum Sorter
+    {
+        Checked,
+        Name,
+        Id,
+        Version,
+        NewVersion,
+        Source,
+        DownloadSize,
+        ReleaseDate,
+    }
+
+    public Sorter CurrentSorter { get; private set; } = Sorter.Name;
+    private bool _ascending = true;
+
+    /// <summary>Fires when any wrapper's IsChecked changes, or when items are added/removed.</summary>
+    public event EventHandler? SelectionStateChanged;
+
+    public ObservablePackageCollection()
+    {
+        CollectionChanged += OnCollectionChanged;
+    }
+
+    private void OnCollectionChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+    {
+        if (e.OldItems is not null)
+            foreach (PackageWrapper w in e.OldItems) w.PropertyChanged -= OnWrapperPropertyChanged;
+        if (e.NewItems is not null)
+            foreach (PackageWrapper w in e.NewItems) w.PropertyChanged += OnWrapperPropertyChanged;
+        SelectionStateChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void OnWrapperPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(PackageWrapper.IsChecked))
+            SelectionStateChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>Returns the tri-state value for a "select-all" checkbox: true=all, false=none, null=some.</summary>
+    public bool? GetSelectionState()
+    {
+        if (Count == 0) return false;
+        int checkedCount = 0;
+        foreach (var w in this) if (w.IsChecked) checkedCount++;
+        if (checkedCount == 0) return false;
+        if (checkedCount == Count) return true;
+        return null;
+    }
+
+    public List<IPackage> GetPackages() =>
+        this.Select(w => w.Package).ToList();
+
+    public List<IPackage> GetCheckedPackages() =>
+        this.Where(w => w.IsChecked).Select(w => w.Package).ToList();
+
+    public void SelectAll()
+    {
+        foreach (var w in this) w.IsChecked = true;
+    }
+
+    public void ClearSelection()
+    {
+        foreach (var w in this) w.IsChecked = false;
+    }
+
+    public void ApplyChanges(IEnumerable<PackageWrapper> removed, IEnumerable<PackageWrapper> added)
+        => ApplyChanges(this, removed, added, GetOrderComparer());
+
+    internal static void ApplyChanges<T>(IList<T> list, IEnumerable<T> removed, IEnumerable<T> added, IComparer<T> comparer)
+    {
+        foreach (var item in removed)
+        {
+            int index = IndexOfReference(list, item);
+            if (index >= 0) list.RemoveAt(index);
+        }
+
+        foreach (var item in added)
+        {
+            int low = 0, high = list.Count;
+            while (low < high)
+            {
+                int mid = low + (high - low) / 2;
+                if (comparer.Compare(list[mid], item) <= 0) low = mid + 1;
+                else high = mid;
+            }
+            list.Insert(low, item);
+        }
+    }
+
+    private static int IndexOfReference<T>(IList<T> list, T item)
+    {
+        for (int i = 0; i < list.Count; i++)
+            if (ReferenceEquals(list[i], item)) return i;
+        return -1;
+    }
+
+    public void SortBy(Sorter sorter) => CurrentSorter = sorter;
+
+    public void SetSortDirection(bool ascending) => _ascending = ascending;
+
+    /// <summary>Returns <paramref name="items"/> in the current sort order.</summary>
+    public IEnumerable<PackageWrapper> ApplyToList(IEnumerable<PackageWrapper> items)
+        => items.OrderBy(w => w, GetOrderComparer());
+
+    private IComparer<PackageWrapper> GetOrderComparer()
+    {
+        Sorter sorter = CurrentSorter;
+        bool ascending = _ascending;
+
+        return Comparer<PackageWrapper>.Create((a, b) =>
+        {
+            if (sorter is Sorter.DownloadSize)
+            {
+                int resolved = (a.DownloadSizeBytes > 0 ? 0 : 1).CompareTo(b.DownloadSizeBytes > 0 ? 0 : 1);
+                if (resolved != 0) return resolved;
+            }
+            else if (sorter is Sorter.ReleaseDate)
+            {
+                int resolved = (a.ReleaseDate != default ? 0 : 1).CompareTo(b.ReleaseDate != default ? 0 : 1);
+                if (resolved != 0) return resolved;
+            }
+            return ascending ? Compare(a, b, sorter) : Compare(b, a, sorter);
+        });
+    }
+
+    // Shared by the "Order by" menu (ApplyToList) and the DataGrid's native column sorting
+    // (GetColumnComparer) so both order identically. Versions compare semantically via
+    // CoreTools.Version; a string key can't be used there because that struct has no ToString
+    // override, so its key would be a constant type name that never sorts.
+    private static int Compare(PackageWrapper a, PackageWrapper b, Sorter sorter) => sorter switch
+    {
+        Sorter.Version => a.Package.NormalizedVersion.CompareTo(b.Package.NormalizedVersion),
+        Sorter.DownloadSize => DownloadSizeSortKey(a).CompareTo(DownloadSizeSortKey(b)),
+        Sorter.ReleaseDate => ReleaseDateSortKey(a).CompareTo(ReleaseDateSortKey(b)),
+        Sorter.NewVersion => a.Package.NormalizedNewVersion.CompareTo(b.Package.NormalizedNewVersion),
+        _ => string.Compare(GetSortKey(a, sorter), GetSortKey(b, sorter), StringComparison.OrdinalIgnoreCase),
+    };
+
+    private static long DownloadSizeSortKey(PackageWrapper wrapper)
+        => wrapper.DownloadSizeBytes > 0 ? wrapper.DownloadSizeBytes : long.MaxValue;
+
+    private static DateTime ReleaseDateSortKey(PackageWrapper wrapper)
+        => wrapper.ReleaseDate != default ? wrapper.ReleaseDate : DateTime.MaxValue;
+
+    private static string GetSortKey(PackageWrapper w, Sorter sorter) => sorter switch
+    {
+        Sorter.Checked => w.IsChecked ? "0" : "1",
+        Sorter.Name => w.Package.Name,
+        Sorter.Id => w.Package.Id,
+        Sorter.Source => w.Package.Source.AsString_DisplayName,
+        _ => w.Package.Name,
+    };
+
+    // Comparer for the DataGrid's native column sorting. Reflection-free (unlike SortMemberPath),
+    // so it keeps working under full-trim NativeAOT release builds — see issue #5103.
+    public static IComparer GetColumnComparer(Sorter sorter) =>
+        Comparer<PackageWrapper>.Create((a, b) => Compare(a, b, sorter));
+}

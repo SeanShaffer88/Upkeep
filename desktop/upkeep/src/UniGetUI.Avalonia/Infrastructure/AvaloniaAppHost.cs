@@ -1,0 +1,374 @@
+using System.IO;
+using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
+using Avalonia;
+using Avalonia.Automation;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Media;
+#if WINDOWS
+using Avalonia.Win32;
+#endif
+using Avalonia.Threading;
+using UniGetUI.Core.Data;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.Tools;
+using UniGetUI.Interface;
+using UniGetUI.Shared;
+
+namespace UniGetUI.Avalonia.Infrastructure;
+
+public static class AvaloniaAppHost
+{
+    private static Mutex? _singleInstanceMutex;
+    private static FileStream? _singleInstanceLock;
+
+    private static Action<string[]>? _secondaryInstanceArgsReceived;
+    private static readonly Queue<string[]> _bufferedSecondaryInstanceArgs = new();
+
+    public static event Action<string[]>? SecondaryInstanceArgsReceived
+    {
+        add
+        {
+            _secondaryInstanceArgsReceived += value;
+
+            if (value is null || _bufferedSecondaryInstanceArgs.Count == 0)
+                return;
+
+            string[][] buffered = [.. _bufferedSecondaryInstanceArgs];
+            _bufferedSecondaryInstanceArgs.Clear();
+
+            Dispatcher.UIThread.Post(() =>
+            {
+                foreach (string[] bufferedArgs in buffered)
+                    value(bufferedArgs);
+            });
+        }
+        remove => _secondaryInstanceArgsReceived -= value;
+    }
+
+    private static readonly List<string[]> _launchesWhileQuitting = [];
+
+    public static void RecordLaunchWhileQuitting(string[] args)
+    {
+        lock (_launchesWhileQuitting)
+            _launchesWhileQuitting.Add(args);
+    }
+
+    public static IReadOnlyList<string[]> TakeLaunchesWhileQuitting()
+    {
+        lock (_launchesWhileQuitting)
+        {
+            string[][] launches = [.. _launchesWhileQuitting];
+            _launchesWhileQuitting.Clear();
+            return launches;
+        }
+    }
+
+    public static async Task StopAcceptingLaunchesAsync()
+    {
+        try
+        {
+            await SingleInstanceRedirector.StopListenerAsync();
+        }
+        catch (TimeoutException)
+        {
+            Logger.Warn("Timed out while waiting for forwarded launches to be delivered");
+        }
+
+        await Dispatcher.UIThread.InvokeAsync(static () => { }, DispatcherPriority.Background);
+    }
+
+    public static void ReleaseSingleInstance()
+    {
+        Interlocked.Exchange(ref _singleInstanceMutex, null)?.Dispose();
+        Interlocked.Exchange(ref _singleInstanceLock, null)?.Dispose();
+    }
+
+    private static void RaiseSecondaryInstanceArgs(string[] args)
+    {
+        if (_secondaryInstanceArgsReceived is null)
+        {
+            Logger.Info("Buffering forwarded arguments until the main window is ready");
+            _bufferedSecondaryInstanceArgs.Enqueue(args);
+            return;
+        }
+
+        _secondaryInstanceArgsReceived(args);
+    }
+
+    public static void Run(string[] args)
+    {
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            CrashHandler.ReportFatalException((Exception)e.ExceptionObject);
+
+        args = SharedPreUiCommandDispatcher.IgnoreArgumentsInjectedIntoProtocolLaunch(args);
+        CoreData.SetSanitizedProcessArguments(args);
+
+        Logger.RedactUsername = Core.SettingsEngine.Settings.Get(Core.SettingsEngine.Settings.K.RedactUsernameInLog);
+
+        ProcessEnvironmentConfigurator.ConfigurePingetStorage();
+
+        bool cliConsoleReady = ShouldPrepareCliConsole(args) && WindowsConsoleHost.PrepareCliIO();
+
+        if (OperatingSystem.IsWindows() && !cliConsoleReady && IpcCliSyntax.IsHelpRequest(args))
+        {
+            CoreTools.Launch(CliDocumentationUrl);
+            return;
+        }
+
+        if (AvaloniaCliHandler.HandlePreUiArgs(args) is { } exitCode)
+        {
+            Environment.Exit(exitCode);
+            return;
+        }
+
+        if (IpcCliSyntax.IsIpcCommand(args))
+        {
+            Environment.ExitCode = IpcCliCommandRunner.RunAsync(args, Console.Out, Console.Error)
+                .GetAwaiter()
+                .GetResult();
+            return;
+        }
+
+        if (HeadlessModeOptions.IsHeadless(args))
+        {
+            Environment.ExitCode = HeadlessDaemonHost.RunAsync().GetAwaiter().GetResult();
+            return;
+        }
+
+        CoreData.WasDaemon = CoreData.IsDaemon = args.Contains(AvaloniaCliHandler.DAEMON);
+
+        string textart = $"""
+               __  __      _ ______     __  __  ______
+              / / / /___  (_) ____/__  / /_/ / / /  _/
+             / / / / __ \/ / / __/ _ \/ __/ / / // /
+            / /_/ / / / / / /_/ /  __/ /_/ /_/ // /
+            \____/_/ /_/_/\____/\___/\__/\____/___/
+                Welcome to UniGetUI Version {CoreData.VersionName}
+            """;
+
+        Logger.ImportantInfo(textart);
+        Logger.ImportantInfo("  ");
+        Logger.ImportantInfo($"Build {CoreData.BuildNumber}");
+        Logger.ImportantInfo("UI Framework: Avalonia");
+        Logger.ImportantInfo($"Data directory {CoreData.UniGetUIDataDirectory}");
+        Logger.ImportantInfo($"OS: {RuntimeInformation.OSDescription}");
+        Logger.ImportantInfo($"Process arch: {RuntimeInformation.ProcessArchitecture} (OS: {RuntimeInformation.OSArchitecture})");
+        Logger.ImportantInfo($"Runtime: {RuntimeInformation.FrameworkDescription}");
+        Logger.ImportantInfo($"UI font: {UiFontPolicy.ResolveDefaultFamilyName() ?? "(platform default)"}");
+        Logger.ImportantInfo($"UI font fallbacks: {(UiFontPolicy.ResolveFontFallbacks() is { } fallbacks
+            ? string.Join(", ", fallbacks.Select(f => f.FontFamily.Name))
+            : "(none)")}");
+        Logger.ImportantInfo($"Elevated: {CoreTools.IsAdministrator()}");
+        Logger.ImportantInfo($"Packaged (MSIX): {CoreTools.IsPackagedApp()}");
+        Logger.ImportantInfo($"Args: {(args.Length > 0 ? string.Join(" ", args) : "(none)")}");
+
+        // Bind Avalonia's UI-thread dispatcher to this (main/STA) thread before the single-instance
+        // listener starts: if a second instance connects mid-startup, the listener's Dispatcher.UIThread.Post
+        // would otherwise bind it to the worker thread and make Win32Platform.Initialize throw.
+        _ = Dispatcher.UIThread;
+
+        args = StartupBundleArguments.Normalize(args, Environment.CurrentDirectory);
+
+        if (!TryRegisterSingleInstance(args))
+        {
+            return;
+        }
+
+        // Before Avalonia's X11 platform starts, since that is when it reads the scale.
+        LinuxDisplayScaling.ApplyXSettingsScale();
+
+        try
+        {
+            BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+        }
+        catch (ElementNotEnabledException ex)
+        {
+            ResumeAfterRefusedAutomation(ex);
+        }
+    }
+
+    /// <summary>
+    /// An accessibility client (VoiceOver, UI automation) invoking a disabled control makes Avalonia
+    /// throw <see cref="ElementNotEnabledException"/>. On macOS that escapes the native run loop with
+    /// no handler and would end the app, although the right outcome is to ignore the request. The
+    /// windows and lifetime are still intact, so log it and keep running the main loop until the
+    /// lifetime's normal exit.
+    /// </summary>
+    private static void ResumeAfterRefusedAutomation(ElementNotEnabledException first)
+    {
+        if (Application.Current?.ApplicationLifetime is not IClassicDesktopStyleApplicationLifetime lifetime)
+        {
+            ExceptionDispatchInfo.Capture(first).Throw();
+            return;
+        }
+        using var exited = new CancellationTokenSource();
+        lifetime.Exit += (_, e) =>
+        {
+            Environment.ExitCode = e.ApplicationExitCode;
+            exited.Cancel();
+        };
+        Exception? refused = first;
+        while (!exited.IsCancellationRequested)
+        {
+            Logger.Warn("An accessibility client tried to invoke a disabled control; ignoring it.");
+            Logger.Warn(refused!);
+            try
+            {
+                Dispatcher.UIThread.MainLoop(exited.Token);
+                refused = null;
+            }
+            catch (ElementNotEnabledException ex)
+            {
+                refused = ex;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds the font options the app builder is configured with, so the policy's output and the
+    /// options it is carried in can be exercised without standing up Avalonia.
+    /// </summary>
+    public static FontManagerOptions BuildFontManagerOptions()
+        => new()
+        {
+            DefaultFamilyName = UiFontPolicy.ResolveDefaultFamilyName(),
+            FontFallbacks = UiFontPolicy.ResolveFontFallbacks(),
+        };
+
+    public const long MinimumGpuResourceCacheBytes = 128L * 1024 * 1024;
+    public const long GpuResourceCacheHeadroomBytes = 96L * 1024 * 1024;
+
+    public static long GpuResourceCacheBytes(long largestScreenPixels)
+        => Math.Max(MinimumGpuResourceCacheBytes, largestScreenPixels * 4 + GpuResourceCacheHeadroomBytes);
+
+    public static SkiaOptions BuildSkiaOptions(long largestScreenPixels)
+        => new() { MaxGpuResourceSizeBytes = GpuResourceCacheBytes(largestScreenPixels) };
+
+    public static AppBuilder BuildAvaloniaApp()
+    {
+        AppBuilder builder = AppBuilder.Configure<App>()
+            .UsePlatformDetect();
+
+        FontManagerOptions fontOptions = BuildFontManagerOptions();
+
+        if (fontOptions.DefaultFamilyName is { } fontFamily && UiFontPolicy.RequiresBundledFont(fontFamily))
+        {
+            builder = builder.WithInterFont();
+        }
+
+        if (fontOptions.DefaultFamilyName is not null || fontOptions.FontFallbacks is not null)
+        {
+            builder = builder.With(fontOptions);
+        }
+
+#if WINDOWS
+        if (WindowsAvaloniaRenderingPolicy.ShouldUseSoftwareRendering)
+        {
+            builder = builder.With(new Win32PlatformOptions
+            {
+                RenderingMode = [Win32RenderingMode.Software],
+            });
+        }
+#endif
+
+        builder = builder.With(BuildSkiaOptions(DisplayMetrics.LargestScreenPixels()));
+
+        return builder.LogToTrace();
+    }
+
+    private const string CliDocumentationUrl =
+        "https://github.com/Devolutions/UniGetUI/blob/main/docs/CLI.md#unigetui-command-line-interface";
+
+    private static bool ShouldPrepareCliConsole(IReadOnlyList<string> args)
+    {
+        return IpcCliSyntax.HasVerbCommand(args) || IpcCliSyntax.IsHelpRequest(args);
+    }
+
+    private static bool TryRegisterSingleInstance(string[] args)
+    {
+        // macOS uses a file lock instead of a Mutex: named Mutexes are not shared across processes
+        // under NativeAOT (what ships), so they can't detect the first instance.
+        if (OperatingSystem.IsWindows())
+            return TryRegisterWithMutex(args);
+
+        if (OperatingSystem.IsMacOS())
+            return TryRegisterWithFileLock(args);
+
+        return true;
+    }
+
+    private static bool TryRegisterWithMutex(string[] args)
+    {
+        _singleInstanceMutex = new Mutex(
+            initiallyOwned: true,
+            name: CoreData.MainWindowIdentifier,
+            createdNew: out bool createdNew
+        );
+
+        if (createdNew)
+        {
+            SingleInstanceRedirector.StartListener(RaiseSecondaryInstanceArgs);
+            return true;
+        }
+
+        if (SingleInstanceRedirector.TryForwardToFirstInstance(args))
+        {
+            _singleInstanceMutex.Dispose();
+            _singleInstanceMutex = null;
+            return false;
+        }
+
+        _singleInstanceMutex.Dispose();
+        _singleInstanceMutex = new Mutex(
+            initiallyOwned: true,
+            name: CoreData.MainWindowIdentifier,
+            createdNew: out createdNew
+        );
+        if (createdNew)
+        {
+            SingleInstanceRedirector.StartListener(RaiseSecondaryInstanceArgs);
+            return true;
+        }
+
+        _singleInstanceMutex.Dispose();
+        _singleInstanceMutex = null;
+        Logger.Warn("Could not redirect to the existing Avalonia instance; starting a new one");
+        return true;
+    }
+
+    private static bool TryRegisterWithFileLock(string[] args)
+    {
+        // FileShare.None is an flock() advisory lock the OS releases on exit (even on crash), so the
+        // lock file never goes stale. The static FileStream holds the lock for the process lifetime.
+        string lockPath = Path.Combine(Path.GetTempPath(), $"UniGetUI_{Environment.UserName}.lock");
+        if (!TryTakeFileLock(lockPath))
+        {
+            if (SingleInstanceRedirector.TryForwardToFirstInstance(args))
+                return false;
+
+            if (!TryTakeFileLock(lockPath))
+            {
+                Logger.Warn("Could not redirect to the existing Avalonia instance; starting a new one");
+                return true;
+            }
+        }
+
+        SingleInstanceRedirector.StartListener(RaiseSecondaryInstanceArgs);
+        return true;
+    }
+
+    private static bool TryTakeFileLock(string lockPath)
+    {
+        try
+        {
+            _singleInstanceLock = new FileStream(
+                lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+}

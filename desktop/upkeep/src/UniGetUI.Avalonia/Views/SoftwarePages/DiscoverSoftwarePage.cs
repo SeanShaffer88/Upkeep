@@ -1,0 +1,362 @@
+using Avalonia;
+using Avalonia.Automation;
+using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Media;
+using Avalonia.Threading;
+using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Avalonia.ViewModels;
+using UniGetUI.Avalonia.ViewModels.Pages;
+using UniGetUI.Avalonia.Views;
+using UniGetUI.Avalonia.Views.Controls;
+using UniGetUI.Avalonia.Views.DialogPages;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.Tools;
+using UniGetUI.Interface.Enums;
+using UniGetUI.Interface.Telemetry;
+using UniGetUI.PackageEngine;
+using UniGetUI.PackageEngine.Classes.Manager.Classes;
+using UniGetUI.PackageEngine.Enums;
+using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.PackageClasses;
+using UniGetUI.PackageEngine.PackageLoader;
+
+namespace UniGetUI.Avalonia.Views.Pages;
+
+public class DiscoverSoftwarePage : AbstractPackagesPage
+{
+    // Context-menu items whose enabled state depends on the focused package's manager
+    private MenuItem? _menuAsAdmin;
+    private MenuItem? _menuInteractive;
+    private MenuItem? _menuSkipHash;
+    private MenuItem? _menuDownloadInstaller;
+    private MenuItem? _menuCopyLink;
+    private MenuItem? _menuManual;
+
+    public DiscoverSoftwarePage(CatalogEditorViewModel? catalogEditor = null) : base(new PackagesPageData
+    {
+        PageName = "SoftwarePages.DiscoverSoftwarePage",
+        PageTitle = CoreTools.Translate("Discover Packages"),
+        IconName = "DiscoverPackage",
+        PageRole = OperationType.Install,
+        Loader = DiscoverablePackagesLoader.Instance ?? new DiscoverablePackagesLoader([]),
+        MegaQueryBlockEnabled = true,
+        DisableSuggestedResultsRadio = false,
+        PackagesAreCheckedByDefault = false,
+        ShowLastLoadTime = false,
+        DisableAutomaticPackageLoadOnStart = true,
+        DisableFilterOnQueryChange = true,
+        DisableReload = false,
+        NoPackages_BackgroundText = CoreTools.Translate("No results were found matching the input criteria"),
+        NoPackages_SourcesText = CoreTools.Translate("No packages were found"),
+        NoPackages_SubtitleText_Base = CoreTools.Translate("No packages were found"),
+        MainSubtitle_StillLoading = CoreTools.Translate("Loading packages"),
+        NoMatches_BackgroundText = CoreTools.Translate("No results were found matching the input criteria"),
+    }, vm => AddCatalogToolbar(vm, catalogEditor))
+    {
+        _catalogEditor = catalogEditor;
+    }
+
+    private readonly CatalogEditorViewModel? _catalogEditor;
+
+    private static void AddCatalogToolbar(PackagesPageViewModel vm, CatalogEditorViewModel? document)
+    {
+        if (document is null) return;
+        // The target catalog is picked in a dialog when adding, so no selector sits in the toolbar.
+        var button = vm.AddToolbarButton("catalog_add", CoreTools.Translate("Add selection to catalog"),
+            () => _ = AddSelectionToCatalogAsync(vm, document));
+        ToolTip.SetShowOnDisabled(button, true);
+        void UpdateState()
+        {
+            button.IsEnabled = document.CanEdit && document.Catalogs.Count > 0
+                && vm.FilteredPackages.GetCheckedPackages().Count > 0;
+            ToolTip.SetTip(button, !document.IsLoaded && document.Message.Length > 0
+                ? document.Message
+                : document.IsLoaded && document.Catalogs.Count == 0
+                    ? CoreTools.Translate("Create a catalog in the Catalog Editor first.")
+                    : CoreTools.Translate("Add selection to catalog"));
+        }
+        document.PropertyChanged += (_, _) => UpdateState();
+        document.Catalogs.CollectionChanged += (_, _) => UpdateState();
+        vm.PackageCountUpdated += UpdateState;
+        UpdateState();
+    }
+
+    public override async void OnEnter()
+    {
+        base.OnEnter();
+        // Use the document handed in at construction: when Discover is the startup page it is entered
+        // before the main window is registered, so looking it up through the window would find nothing.
+        if (_catalogEditor is { } document)
+            await document.EnsureLoadedAsync();
+    }
+
+    private static async Task AddSelectionToCatalogAsync(PackagesPageViewModel vm, CatalogEditorViewModel document)
+    {
+        try
+        {
+            var packages = vm.FilteredPackages.GetCheckedPackages();
+            if (packages.Count == 0) return;
+            if (!await document.EnsureLoadedAsync()) return;
+            var targets = await ChooseCatalogsAsync(document, packages.Count);
+            if (targets.Count == 0) return;
+            var results = document.AddPackages(packages, targets);
+            document.SelectedCatalog = targets[0];
+            if (GetMainWindow() is { DataContext: MainWindowViewModel main } window)
+            {
+                await main.NavigateToAsync(PageType.CatalogEditor);
+                window.ShowBanner(results.Count == 1
+                        ? CoreTools.Translate("Packages added to catalog")
+                        : CoreTools.Translate("Packages added to {0} catalogs", results.Count),
+                    DescribeAddResults(results), MainWindow.RuntimeNotificationLevel.Success);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("Could not add packages to the catalog.");
+            Logger.Error(ex);
+            document.Message = CoreTools.Translate("Could not add packages to the catalog: {0}", ex.Message);
+            GetMainWindow()?.ShowBanner(CoreTools.Translate("Could not add packages to the catalog"),
+                ex.Message, MainWindow.RuntimeNotificationLevel.Error);
+        }
+    }
+
+    // Asks which catalogs receive the selection; the one last used or open in the editor starts ticked.
+    private static async Task<IReadOnlyList<CatalogEditorCatalog>> ChooseCatalogsAsync(CatalogEditorViewModel document, int count)
+    {
+        if (GetMainWindow() is not { } window || document.Catalogs.Count == 0) return [];
+        var catalogs = document.Catalogs.ToList();
+        var initial = document.SelectedCatalog is { } current && catalogs.Contains(current) ? current : catalogs[0];
+        var boxes = catalogs.Select(c => new CheckBox { Content = c.Name, IsChecked = ReferenceEquals(c, initial) }).ToList();
+
+        var list = new StackPanel { Spacing = 2 };
+        foreach (var box in boxes) list.Children.Add(box);
+        var body = new StackPanel { Spacing = 8 };
+        body.Children.Add(new TextBlock
+        {
+            Text = count == 1
+                ? CoreTools.Translate("Choose the catalogs to add the selected package to.")
+                : CoreTools.Translate("Choose the catalogs to add the {0} selected packages to.", count),
+            TextWrapping = TextWrapping.Wrap,
+        });
+        body.Children.Add(new ScrollViewer { Content = list, MaxHeight = 260 });
+
+        var dialog = new ImmersiveConfirmationDialog(CoreTools.Translate("Add selection to catalog"), body,
+            CoreTools.Translate("Add"), CoreTools.Translate("Cancel"));
+        var confirm = dialog.GetControl<Button>("PrimaryButton");
+        void UpdateConfirm()
+        {
+            int ticked = boxes.Count(b => b.IsChecked == true);
+            string label = ticked <= 1 ? CoreTools.Translate("Add") : CoreTools.Translate("Add to {0} catalogs", ticked);
+            confirm.Content = label;
+            AutomationProperties.SetName(confirm, label);
+            confirm.IsEnabled = ticked > 0;
+        }
+        foreach (var box in boxes) box.IsCheckedChanged += (_, _) => UpdateConfirm();
+        UpdateConfirm();
+
+        await dialog.ShowDialog(window);
+        if (dialog.Result is not true || !document.CanEdit) return [];
+        return catalogs.Where((c, i) => boxes[i].IsChecked == true && document.Catalogs.Contains(c)).ToList();
+    }
+
+    private static string DescribeAddResults(IReadOnlyList<CatalogAddResult> results)
+    {
+        if (results.Count == 1)
+        {
+            var only = results[0];
+            string text = CatalogEditorViewModel.AddedToCatalogMessage(only.Added, only.Catalog.Name);
+            return only.AlreadyPresent switch
+            {
+                0 => text,
+                1 => text + "\n" + CoreTools.Translate("1 was already in the catalog."),
+                _ => text + "\n" + CoreTools.Translate("{0} were already in the catalog.", only.AlreadyPresent),
+            };
+        }
+        var lines = results.Select(r => r.AlreadyPresent == 0
+            ? CoreTools.Translate("{0}: {1} added", r.Catalog.Name, r.Added)
+            : CoreTools.Translate("{0}: {1} added, {2} already there", r.Catalog.Name, r.Added, r.AlreadyPresent));
+        return string.Join("\n", lines.Append(CoreTools.Translate("Save the catalog to keep your changes.")));
+    }
+
+    protected override void GenerateToolBar(PackagesPageViewModel vm)
+    {
+        // ── Main button dropdown: install variants ──────────────────────────
+        var installAsAdmin = new MenuItem { Header = CoreTools.Translate("Install as administrator"), IsVisible = OperatingSystem.IsWindows() };
+        var installSkipHash = new MenuItem { Header = CoreTools.Translate("Skip integrity checks") };
+        var installInteractive = new MenuItem { Header = CoreTools.Translate("Interactive installation") };
+        var downloadInstallers = new MenuItem { Header = CoreTools.Translate("Download selected installers") };
+
+        SetMainButton("download", CoreTools.Translate("Install selection"), () =>
+            _ = LaunchInstall(vm.FilteredPackages.GetCheckedPackages()));
+
+        EnableMainButtonWhenPackagesChecked();
+        SetMainButtonDropdown(new MenuFlyout
+        {
+            Items = { installAsAdmin, installSkipHash, installInteractive, new Separator(), downloadInstallers },
+        });
+
+        installAsAdmin.Click += (_, _) => _ = LaunchInstall(vm.FilteredPackages.GetCheckedPackages(), elevated: true);
+        installSkipHash.Click += (_, _) => _ = LaunchInstall(vm.FilteredPackages.GetCheckedPackages(), no_integrity: true);
+        installInteractive.Click += (_, _) => _ = LaunchInstall(vm.FilteredPackages.GetCheckedPackages(), interactive: true);
+        downloadInstallers.Click += (_, _) => _ = AvaloniaPackageOperationHelper.DownloadSelectedAsync(
+            vm.FilteredPackages.GetCheckedPackages(), TEL_InstallReferral.DIRECT_SEARCH);
+
+        if (DiscoverablePackagesLoader.Instance is { } discoverLoader)
+        {
+            var sourceSelector = new SearchSourceSelector(discoverLoader);
+            ViewModel.RegisterCollapsibleToolbarLabel(sourceSelector.SummaryLabel);
+            sourceSelector.SelectionCommitted += () =>
+            {
+                if (!string.IsNullOrWhiteSpace(vm.GlobalQueryText)) vm.SubmitSearch();
+            };
+            ViewModel.AddToolbarEntry(
+                new ToolbarEntry(sourceSelector, "Sources", CoreTools.Translate("Sources"),
+                    null, sourceSelector.ShowFlyoutAt),
+                index: 0);
+            if (!ViewModel.DisableReload) ViewModel.AddToolbarSeparator(index: 1);
+        }
+
+        // ── Toolbar buttons ─────────────────────────────────────────────────
+        ViewModel.AddToolbarSeparator(subgroup: !ViewModel.DisableReload);
+        EnableWhen(ViewModel.AddToolbarButton("options", CoreTools.Translate("Install options"),
+            () => _ = ShowInstallationOptionsForPackage(SelectedItem)), () => HasSelectedItem);
+        ViewModel.AddToolbarSeparator(subgroup: true);
+        EnableWhen(ViewModel.AddToolbarButton("console", CoreTools.Translate("Manual install"),
+            () => _ = ManualInstallHelper.LaunchManualAsync(SelectedItem, OperationType.Install)), () => HasSelectedItem);
+        ViewModel.AddToolbarSeparator(subgroup: true);
+        EnableWhen(ViewModel.AddToolbarButton("info_round", CoreTools.Translate("Package details"),
+            () => _ = ShowDetailsForPackage(SelectedItem), showLabel: false), () => HasSelectedItem);
+        ViewModel.AddToolbarSeparator(subgroup: true);
+        EnableWhen(ViewModel.AddToolbarButton("add_to", CoreTools.Translate("Add selection to bundle"),
+            () => _ = ExportSelectionToBundleAsync(vm)), () => HasCheckedPackages);
+    }
+
+    // ─── Context menu ─────────────────────────────────────────────────────────
+    protected override ContextMenu? GenerateContextMenu()
+    {
+        _menuAsAdmin = new MenuItem
+        {
+            Header = CoreTools.Translate("Install as administrator"),
+            Icon = LoadMenuIcon("uac"),
+            IsVisible = OperatingSystem.IsWindows(),
+        };
+        _menuAsAdmin.Click += (_, _) => _ = LaunchInstall([SelectedItem!], elevated: true);
+
+        _menuInteractive = new MenuItem
+        {
+            Header = CoreTools.Translate("Interactive installation"),
+            Icon = LoadMenuIcon("interactive"),
+        };
+        _menuInteractive.Click += (_, _) => _ = LaunchInstall([SelectedItem!], interactive: true);
+
+        _menuSkipHash = new MenuItem
+        {
+            Header = CoreTools.Translate("Skip hash check"),
+            Icon = LoadMenuIcon("checksum"),
+        };
+        _menuSkipHash.Click += (_, _) => _ = LaunchInstall([SelectedItem!], no_integrity: true);
+
+        _menuDownloadInstaller = new MenuItem
+        {
+            Header = CoreTools.Translate("Download installer"),
+            Icon = LoadMenuIcon("download"),
+        };
+        _menuDownloadInstaller.Click += (_, _) => _ = AvaloniaPackageOperationHelper.AskLocationAndDownloadAsync(
+            SelectedItem, TEL_InstallReferral.DIRECT_SEARCH);
+
+        var menuInstall = new MenuItem { Header = ShortcutHeader(CoreTools.Translate("Install"), MainActionShortcut), Icon = LoadMenuIcon("download") };
+        menuInstall.Click += (_, _) => _ = LaunchInstall([SelectedItem!]);
+
+        var menuInstallOptions = new MenuItem { Header = ShortcutHeader(CoreTools.Translate("Install options"), OptionsShortcut), Icon = LoadMenuIcon("options") };
+        menuInstallOptions.Click += (_, _) => _ = ShowInstallationOptionsForPackage(SelectedItem);
+
+        _menuManual = new MenuItem { Header = CoreTools.Translate("Manual install"), Icon = LoadMenuIcon("console") };
+        _menuManual.Click += (_, _) => _ = ManualInstallHelper.LaunchManualAsync(SelectedItem, OperationType.Install);
+
+        var menuDetails = new MenuItem { Header = ShortcutHeader(CoreTools.Translate("Package details"), DetailsShortcut), Icon = LoadMenuIcon("info_round") };
+        menuDetails.Click += (_, _) => _ = ShowDetailsForPackage(SelectedItem);
+
+        _menuCopyLink = CreateCopyLinkMenuItem();
+
+        var menu = new ContextMenu();
+        menu.Items.Add(menuInstall);
+        menu.Items.Add(new Separator());
+        menu.Items.Add(menuInstallOptions);
+        menu.Items.Add(_menuManual);
+        menu.Items.Add(new Separator());
+        menu.Items.Add(_menuAsAdmin);
+        menu.Items.Add(_menuInteractive);
+        menu.Items.Add(_menuSkipHash);
+        menu.Items.Add(_menuDownloadInstaller);
+        menu.Items.Add(new Separator());
+        menu.Items.Add(menuDetails);
+        menu.Items.Add(_menuCopyLink);
+
+        return menu;
+    }
+
+    protected override void WhenShowingContextMenu(IPackage package)
+    {
+        if (_menuAsAdmin is null || _menuInteractive is null
+            || _menuSkipHash is null || _menuDownloadInstaller is null || _menuCopyLink is null || _menuManual is null)
+        {
+            Logger.Warn("Context menu items are null on DiscoverSoftwarePage");
+            return;
+        }
+
+        _menuAsAdmin.IsEnabled = package.Manager.Capabilities.CanRunAsAdmin;
+        _menuInteractive.IsEnabled = package.Manager.Capabilities.CanRunInteractively;
+        _menuSkipHash.IsEnabled = package.Manager.Capabilities.CanSkipIntegrityChecks;
+        _menuDownloadInstaller.IsEnabled = package.Manager.Capabilities.CanDownloadInstaller;
+        _menuCopyLink.IsEnabled = PackageLink.CanLinkTo(package);
+    }
+
+    // ─── Abstract action overrides ────────────────────────────────────────────
+    protected override void PerformMainPackageAction(IPackage? package)
+    {
+        if (package is null) return;
+        _ = LaunchInstall([package]);
+    }
+
+    protected override bool SupportsDetailsPane => true;
+
+    protected override PackageDetailsWindow CreateDetailsPaneView(IPackage package) =>
+        new(package, OperationType.Install, TEL_InstallReferral.DIRECT_SEARCH, embedded: true);
+
+    protected override async Task ShowDetailsForPackage(IPackage? package)
+    {
+        if (package is null) return;
+        if (GetMainWindow() is not { } win) return;
+
+        var dialog = new PackageDetailsWindow(
+            package, OperationType.Install, TEL_InstallReferral.DIRECT_SEARCH);
+        await dialog.ShowDialog(win);
+
+        if (dialog.ShouldProceedWithOperation)
+            await LaunchInstall([package]);
+    }
+
+    protected override async Task ShowInstallationOptionsForPackage(IPackage? package)
+    {
+        if (package is null || package.Source.IsVirtualManager) return;
+
+        var opts = await InstallOptionsFactory.LoadForPackageAsync(package);
+        if (GetMainWindow() is not { } win) return;
+
+        var dialog = new InstallOptionsWindow(package, OperationType.Install, opts);
+        await dialog.ShowDialog(win);
+        await InstallOptionsFactory.SaveForPackageAsync(opts, package);
+
+        if (dialog.ShouldProceedWithOperation)
+            await LaunchInstall([package]);
+    }
+
+    private static async Task ExportSelectionToBundleAsync(PackagesPageViewModel vm)
+    {
+        var packages = vm.FilteredPackages.GetCheckedPackages();
+        GetMainWindow()?.Navigate(PageType.Bundles);
+        if (PackageBundlesLoader.Instance is not null)
+            await PackageBundlesLoader.Instance.AddPackagesAsync(packages);
+    }
+}

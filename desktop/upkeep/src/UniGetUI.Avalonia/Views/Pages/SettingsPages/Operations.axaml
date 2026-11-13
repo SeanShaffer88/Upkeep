@@ -1,0 +1,139 @@
+<UserControl x:Class="UniGetUI.Avalonia.Views.Pages.SettingsPages.Operations"
+             xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:automation="clr-namespace:Avalonia.Automation;assembly=Avalonia.Controls"
+             xmlns:vm="using:UniGetUI.Avalonia.ViewModels.Pages.SettingsPages"
+             xmlns:settings="using:UniGetUI.Avalonia.Views.Controls.Settings"
+             xmlns:t="using:UniGetUI.Avalonia.MarkupExtensions"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="d"
+             x:DataType="vm:OperationsViewModel">
+
+    <ScrollViewer HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Orientation="Vertical">
+
+            <settings:TranslatedTextBlock Text="Concurrency and execution"
+                                          FontSize="14"
+                                          FontWeight="SemiBold"
+                                          Margin="44,32,4,8"
+                                          automation:AutomationProperties.HeadingLevel="2"/>
+
+            <settings:ComboboxCard x:Name="ParallelOperationCount"
+                                   SettingName="ParallelOperationCount"
+                                   Text="{t:Translate Choose how many operations should be performed in parallel}"
+                                   ValueChangedCommand="{Binding UpdateMaxOperationsCommand}"
+                                   CornerRadius="8,8,0,0"/>
+
+            <settings:CheckboxCard x:Name="ClearSuccessfulOpsCard"
+                                   SettingName="MaintainSuccessfulInstalls"
+                                   ForceInversion="True"
+                                   Text="{t:Translate Clear successful operations from the operation list after a 5 second delay}"
+                                   WarningText="{t:Translate Download operations are not affected by this setting}"
+                                   BorderThickness="1,0,1,1"
+                                   CornerRadius="0,0,8,8"/>
+
+            <UserControl Height="16"/>
+
+            <settings:CheckboxCard x:Name="KillProcessesCard"
+                                   SettingName="KillProcessesThatRefuseToDie"
+                                   Text="{t:Translate Try to kill the processes that refuse to close when requested to}"
+                                   WarningText="{t:Translate You may lose unsaved data}"
+                                   CornerRadius="8"/>
+
+            <settings:TranslatedTextBlock Text="Installer downloads"
+                                          FontSize="14"
+                                          FontWeight="SemiBold"
+                                          Margin="44,32,4,8"
+                                          automation:AutomationProperties.HeadingLevel="2"/>
+
+            <settings:ButtonCard x:Name="DownloadLocationCard"
+                                 Text="{t:Translate Default location for downloaded installers}"
+                                 ButtonText="{t:Translate Select}"
+                                 Command="{Binding PickDownloadDirectoryCommand}"
+                                 CommandParameter="{Binding $self}"
+                                 CornerRadius="8,8,0,0">
+                <settings:ButtonCard.Description>
+                    <StackPanel Orientation="Horizontal" Spacing="4">
+                        <TextBlock Text="{Binding DownloadDirectoryLabel}"
+                                   VerticalAlignment="Center"
+                                   MaxWidth="360"
+                                   FontSize="12"
+                                   Opacity="0.7"
+                                   TextTrimming="CharacterEllipsis"/>
+                        <Button Content="{t:Translate Reset}"
+                                Margin="4,0"
+                                IsEnabled="{Binding IsCustomDownloadDirectorySet}"
+                                Command="{Binding ResetDownloadDirectoryCommand}"
+                                automation:AutomationProperties.Name="{t:Translate Reset the default installer download location}"/>
+                        <Button Content="{t:Translate Open}"
+                                Margin="4,0"
+                                IsEnabled="{Binding IsCustomDownloadDirectorySet}"
+                                Command="{Binding OpenDownloadDirectoryCommand}"
+                                automation:AutomationProperties.Name="{t:Translate Open the default installer download location}"/>
+                    </StackPanel>
+                </settings:ButtonCard.Description>
+            </settings:ButtonCard>
+
+            <settings:ComboboxCard x:Name="InstallerNameSchemeCard"
+                                   SettingName="InstallerFileNameScheme"
+                                   Text="{t:Translate Name of the downloaded installer files}"
+                                   Description="{t:Translate Text='Adding the version to the file name makes downloaded installers sortable and keeps a new download from overwriting the installer of an older version.'}"
+                                   BorderThickness="1,0,1,1"
+                                   CornerRadius="0,0,8,8"/>
+
+            <settings:TranslatedTextBlock Text="Environment variables in custom install options"
+                                          FontSize="14"
+                                          FontWeight="SemiBold"
+                                          Margin="44,32,4,8"
+                                          automation:AutomationProperties.HeadingLevel="2"/>
+
+            <settings:CheckboxCard x:Name="PercentEnvVarSyntaxCard"
+                                   SettingName="ExpandEnvVarsWithPercentSyntax"
+                                   Text="{t:Translate Use %VARIABLE% syntax for environment variables in custom install arguments and locations}"
+                                   WarningText="{t:Translate Text='By default UniGetUI expands &lt;VARIABLE&gt; tokens, which cannot appear in a real path. Enabling this uses the Windows %VARIABLE% syntax instead, which may unexpectedly expand folder names that contain a variable name such as %TEMP%.'}"
+                                   CornerRadius="8"/>
+
+            <settings:TranslatedTextBlock Text="Shortcut management"
+                                          FontSize="14"
+                                          FontWeight="SemiBold"
+                                          Margin="44,32,4,8"
+                                          automation:AutomationProperties.HeadingLevel="2"/>
+
+            <settings:CheckboxButtonCard x:Name="AskToDeleteNewDesktopShortcuts"
+                                         SettingName="AskToDeleteNewDesktopShortcuts"
+                                         CheckboxText="{t:Translate Text='Ask to delete desktop shortcuts created during an install or upgrade.'}"
+                                         ButtonText="{t:Translate Manage shortcuts}"
+                                         CornerRadius="8,8,0,0"/>
+
+            <settings:CheckboxButtonCard x:Name="AskAboutNewStartMenuShortcuts"
+                                         SettingName="AskAboutNewStartMenuShortcuts"
+                                         ButtonAlwaysOn="True"
+                                         CheckboxText="{t:Translate Text='Ask about the Start Menu shortcuts created during an install or upgrade.'}"
+                                         ButtonText="{t:Translate Manage Start Menu shortcuts}"
+                                         BorderThickness="1,0,1,1"
+                                         CornerRadius="0,0,8,8"/>
+
+            <settings:TranslatedTextBlock Text="Related settings"
+                                          FontSize="14"
+                                          FontWeight="SemiBold"
+                                          Margin="44,32,4,8"
+                                          automation:AutomationProperties.HeadingLevel="2"/>
+
+            <settings:SettingsCard CornerRadius="8,8,0,0"
+                                   IsClickEnabled="True"
+                                   Command="{Binding NavigateToUpdatesCommand}"
+                                   Header="{t:Translate Package update preferences}"
+                                   Description="{t:Translate Text='Update check frequency, automatically install updates, etc.'}"/>
+
+            <settings:SettingsCard BorderThickness="1,0,1,1"
+                                   CornerRadius="0,0,8,8"
+                                   IsClickEnabled="True"
+                                   Command="{Binding NavigateToAdministratorCommand}"
+                                   Header="{t:Translate Administrator rights and other dangerous settings}"
+                                   Description="{t:Translate Text='Reduce UAC prompts, elevate installations by default, unlock certain dangerous features, etc.'}"/>
+
+        </StackPanel>
+    </ScrollViewer>
+
+</UserControl>

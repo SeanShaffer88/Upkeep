@@ -1,0 +1,195 @@
+using System.Windows.Input;
+using Avalonia;
+using Avalonia.Automation;
+using Avalonia.Automation.Peers;
+using Avalonia.Controls;
+using Avalonia.Layout;
+using Avalonia.Media;
+using UniGetUI.Avalonia.Extensions;
+using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.SettingsEngine.SecureSettings;
+using UniGetUI.Core.Tools;
+
+namespace UniGetUI.Avalonia.Views.Controls.Settings;
+
+public partial class SecureCheckboxCard : SettingsCard
+{
+    public static readonly StyledProperty<ICommand?> StateChangedCommandProperty =
+        AvaloniaProperty.Register<SecureCheckboxCard, ICommand?>(nameof(StateChangedCommand));
+
+    public ICommand? StateChangedCommand
+    {
+        get => GetValue(StateChangedCommandProperty);
+        set => SetValue(StateChangedCommandProperty, value);
+    }
+
+    public ToggleSwitch _checkbox;
+    public TextBlock _textblock;
+    public TextBlock _warningBlock;
+    public ProgressBar _loading;   // Avalonia has no ProgressRing; use indeterminate ProgressBar
+    private readonly TextBlock _stateLabel;
+    private static readonly string EnabledLabel = CoreTools.Translate("Enabled");
+    private static readonly string DisabledLabel = CoreTools.Translate("Disabled");
+    private bool IS_INVERTED;
+
+    private SecureSettings.K setting_name = SecureSettings.K.Unset;
+    public SecureSettings.K SettingName
+    {
+        set
+        {
+            _checkbox.IsEnabled = false;
+            setting_name = value;
+            IS_INVERTED = SecureSettings.ResolveKey(value).StartsWith("Disable");
+            _checkbox.IsChecked = SecureSettings.Get(setting_name) ^ IS_INVERTED ^ ForceInversion;
+            _textblock.Opacity = (_checkbox.IsChecked ?? false) ? 1 : 0.7;
+            UpdateStateLabel();
+            SyncToggleItemStatus();
+            _checkbox.IsEnabled = true;
+        }
+    }
+
+    public bool ForceInversion { get; set; }
+    public bool Checked => _checkbox.IsChecked ?? false;
+
+    public virtual event EventHandler<EventArgs>? StateChanged;
+
+    public string Text
+    {
+        set
+        {
+            _textblock.Text = value;
+            ApplyAutomationMetadata(_checkbox, value, _warningBlock.IsVisible ? _warningBlock.Text : null);
+            SyncToggleItemStatus();
+        }
+    }
+
+    public string WarningText
+    {
+        set
+        {
+            _warningBlock.Text = CoreTools.FormatAsTwoLines(value);
+            _warningBlock.IsVisible = value.Any();
+            ApplyAutomationMetadata(_checkbox, _textblock.Text, _warningBlock.IsVisible ? value : null);
+            SyncToggleItemStatus();
+        }
+    }
+
+    public SecureCheckboxCard()
+    {
+        _checkbox = new ToggleSwitch
+        {
+            // OnContent/OffContent intentionally left null — the state label is
+            // a sibling TextBlock placed to the LEFT of the knob below.
+            OnContent = null,
+            OffContent = null,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        // Force CheckBox role so macOS VoiceOver exposes checked/unchecked state
+        AutomationProperties.SetControlTypeOverride(_checkbox, AutomationControlType.CheckBox);
+        _stateLabel = new TextBlock
+        {
+            Classes = { "toggle-state-label" },
+            Text = DisabledLabel,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 8, 0),
+        };
+        AutomationProperties.SetAccessibilityView(_stateLabel, AccessibilityView.Raw);
+        _loading = new ProgressBar
+        {
+            IsIndeterminate = false,
+            IsVisible = false,
+            Width = 20,
+            Height = 20,
+            Margin = new Thickness(0, 0, 4, 0),
+        };
+        // Keep the indeterminate clock off while hidden so it doesn't pin the render loop.
+        _loading.Bind(ProgressBar.IsIndeterminateProperty, _loading.GetObservable(Visual.IsVisibleProperty));
+        _textblock = new TextBlock
+        {
+            VerticalAlignment = VerticalAlignment.Center,
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 14,
+        };
+        _warningBlock = new TextBlock
+        {
+            VerticalAlignment = VerticalAlignment.Center,
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 12,
+            IsVisible = false,
+        };
+        _warningBlock.Classes.Add("setting-warning-text");
+        IS_INVERTED = false;
+        AutomationProperties.SetAccessibilityView(_warningBlock, AccessibilityView.Raw);
+
+        Content = new StackPanel
+        {
+            Spacing = 4,
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center,
+            Children = { _loading, _stateLabel, _checkbox },
+        };
+        Header = new StackPanel
+        {
+            Spacing = 4,
+            Orientation = Orientation.Vertical,
+            Children = { _textblock, _warningBlock },
+        };
+
+        _checkbox.IsCheckedChanged += (s, e) => _ = _checkbox_Toggled();
+        ApplyAutomationMetadata(_checkbox, _textblock.Text);
+
+        this.GetObservable(IsEnabledProperty)
+            .SubscribeValue(enabled => _warningBlock.Opacity = enabled ? 1 : 0.2);
+
+        // Keep the toggle group on the right when the SettingsCard enters its wrapped layout.
+        RightAlignWrappedContent = true;
+    }
+
+    protected virtual async Task _checkbox_Toggled()
+    {
+        try
+        {
+            if (_checkbox.IsEnabled is false) return;
+
+            _loading.IsVisible = true;
+            _checkbox.IsEnabled = false;
+            await SecureSettings.TrySet(
+                setting_name,
+                (_checkbox.IsChecked ?? false) ^ IS_INVERTED ^ ForceInversion
+            );
+            StateChanged?.Invoke(this, EventArgs.Empty);
+            var cmd = StateChangedCommand;
+            if (cmd?.CanExecute(null) == true)
+                cmd.Execute(null);
+            _textblock.Opacity = (_checkbox.IsChecked ?? false) ? 1 : 0.7;
+            _checkbox.IsChecked = SecureSettings.Get(setting_name) ^ IS_INVERTED ^ ForceInversion;
+            UpdateStateLabel();
+            SyncToggleItemStatus();
+            if (_textblock.Text is not null)
+            {
+                AccessibilityAnnouncementService.AnnounceToggle(_textblock.Text, _checkbox.IsChecked ?? false);
+            }
+            _loading.IsVisible = false;
+            _checkbox.IsEnabled = true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn(ex);
+            _checkbox.IsChecked = SecureSettings.Get(setting_name) ^ IS_INVERTED ^ ForceInversion;
+            UpdateStateLabel();
+            SyncToggleItemStatus();
+            _loading.IsVisible = false;
+            _checkbox.IsEnabled = true;
+        }
+    }
+
+    private void UpdateStateLabel()
+    {
+        _stateLabel.Text = (_checkbox.IsChecked ?? false) ? EnabledLabel : DisabledLabel;
+    }
+
+    private void SyncToggleItemStatus()
+        => ApplyToggleAutomationState(_checkbox, _checkbox.IsChecked ?? false, _textblock.Text);
+}

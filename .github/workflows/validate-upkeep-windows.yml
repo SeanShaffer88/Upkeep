@@ -1,0 +1,97 @@
+name: Validate Upkeep package
+
+on:
+  push:
+    branches:
+      - agent/upkeep-windows-validation
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - name: Check out Upkeep
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set up Rust for SeanPak
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build Upkeep
+        shell: pwsh
+        run: |
+          $publishDir = Join-Path $PWD 'desktop/upkeep/dist/files'
+          New-Item -ItemType Directory -Force -Path $publishDir | Out-Null
+          dotnet publish desktop/upkeep/src/UniGetUI.Avalonia/UniGetUI.Avalonia.csproj `
+            -c Release -r win-x64 -p:Platform=x64 -o $publishDir
+          if ($LASTEXITCODE -ne 0) { throw 'Upkeep publish failed.' }
+
+          $originalExe = Join-Path $publishDir 'UniGetUI.exe'
+          if (-not (Test-Path $originalExe)) { throw 'Published executable was not found.' }
+          Rename-Item $originalExe 'Upkeep.exe'
+          Copy-Item desktop/upkeep/UPSTREAM-LICENSE.txt $publishDir
+          Copy-Item desktop/upkeep/README.md $publishDir/README.txt
+
+      - name: Check out SeanPak
+        uses: actions/checkout@v4
+        with:
+          repository: SeanShaffer88/SeanPak
+          ref: main
+          path: .seanpak
+
+      - name: Build SeanPak
+        shell: bash
+        working-directory: .seanpak
+        run: |
+          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package with SeanPak
+        shell: bash
+        run: |
+          .seanpak/target/x86_64-pc-windows-msvc/release/seanpak.exe pack \
+            desktop/upkeep/seanpak.json desktop/upkeep/dist/files \
+            --out-dir desktop/upkeep/dist/release --json
+
+      - name: Check package assets
+        shell: pwsh
+        run: |
+          $releaseDir = Join-Path $PWD 'desktop/upkeep/dist/release'
+          $manifest = Get-Content desktop/upkeep/seanpak.json -Raw | ConvertFrom-Json
+          $expected = @(
+            "$($manifest.appName)-v$($manifest.version)-x64-Setup.exe",
+            "$($manifest.appName)-v$($manifest.version)-x64-Portable.zip",
+            'SHA256SUMS.txt'
+          )
+          foreach ($name in $expected) {
+            $path = Join-Path $releaseDir $name
+            if (-not (Test-Path $path)) { throw "Expected package asset was not found: $name" }
+          }
+
+          $sums = Get-Content (Join-Path $releaseDir 'SHA256SUMS.txt') -Raw
+          foreach ($name in $expected | Select-Object -First 2) {
+            if (-not $sums.Contains($name)) { throw "Checksum list does not include: $name" }
+          }
+
+      - name: Verify installer install and uninstall
+        shell: pwsh
+        run: |
+          $manifest = Get-Content desktop/upkeep/seanpak.json -Raw | ConvertFrom-Json
+          $installerName = "$($manifest.appName)-v$($manifest.version)-x64-Setup.exe"
+          $installer = Join-Path $PWD "desktop/upkeep/dist/release/$installerName"
+          & (Join-Path $PWD '.seanpak/target/x86_64-pc-windows-msvc/release/seanpak.exe') `
+            verify $installer --sandbox --json
+          if ($LASTEXITCODE -ne 0) { throw 'SeanPak sandbox verification failed.' }
+
+      - name: Test update scheduling
+        run: dotnet test desktop/upkeep/src/UniGetUI.Core.Tools.Tests/UniGetUI.Core.Tools.Tests.csproj --configuration Release --framework net10.0 --filter FullyQualifiedName~SchedulingTests --verbosity minimal
+
+      - name: Test update-only navigation
+        run: dotnet test desktop/upkeep/src/UniGetUI.Tests/UniGetUI.Tests.csproj --configuration Release --framework net10.0-windows10.0.26100.0 --property:Platform=x64 --filter FullyQualifiedName~SidebarNavigationOrderTests --verbosity minimal

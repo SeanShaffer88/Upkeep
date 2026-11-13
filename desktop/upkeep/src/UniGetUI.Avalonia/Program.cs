@@ -1,0 +1,95 @@
+using System;
+using Avalonia;
+using UniGetUI.AgentSkills.Cli;
+using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Core.Data;
+using UniGetUI.Core.Tools;
+#if WINDOWS
+using UniGetUI.Interface;
+using UniGetUI.PackageEngine.Managers.InstallerFeeds;
+using UniGetUI.PackageEngine.Managers.WinInstallerManager;
+#else
+using UniGetUI.PackageEngine.Managers.MacPkgManager;
+#endif
+using UniGetUI.Interface;
+using UniGetUI.Tui;
+
+namespace UniGetUI.Avalonia;
+
+sealed class Program
+{
+    // Do not initialize Avalonia or other GUI services before AppMain.
+    // The skills command runs independently of the GUI.
+    [STAThread]
+    public static void Main(string[] args)
+    {
+#if !WINDOWS
+        // The root helper runs first, before anything that could log to a folder other users share.
+        if (PkgHelperCommand.IsCommand(args))
+        {
+            Environment.ExitCode = PkgHelperCommand.Run(args[1..], Console.Out, Console.Error);
+            return;
+        }
+#endif
+
+        // All front-ends must wait while the installer replaces their shared files.
+        try
+        {
+            if (UpdateInProgressGuard.IsUpdateInProgress())
+            {
+                Environment.ExitCode = 0;
+                return;
+            }
+        }
+        catch { }
+
+        PersistedEnvironment.Initialize();
+
+        if (args.Length > 0 && args[0] == "skills")
+        {
+            WindowsConsoleHost.PrepareCliIO();
+            Environment.ExitCode = SkillsCli.RunAsync(args[1..]).GetAwaiter().GetResult();
+            return;
+        }
+
+        if (TuiAppHost.TryRunFakeCacheCommand(args, out int fakeExitCode))
+        {
+            Environment.ExitCode = fakeExitCode;
+            return;
+        }
+
+        // Terminal sessions are independent of the desktop UI and its single-instance redirector.
+        if (TuiAppHost.IsCommand(args))
+        {
+            Environment.ExitCode = TuiAppHost.Run(args[1..]);
+            return;
+        }
+
+#if WINDOWS
+        if (FeedIndexCommand.IsCommand(args))
+        {
+            WindowsConsoleHost.PrepareCliIO();
+            Environment.ExitCode = FeedIndexCommand.Run(args[1..], Console.Out, Console.Error, new WinInstallerIndexer());
+            return;
+        }
+#else
+        if (PkgIndexCommand.IsCommand(args))
+        {
+            Environment.ExitCode = PkgIndexCommand.Run(args[1..], Console.Out, Console.Error);
+            return;
+        }
+#endif
+
+#if WINDOWS
+        // Stamp the AUMID onto this process before anything else so Windows attributes
+        // update notifications to Upkeep.
+        Win32ToastNotifier.SetProcessAumid();
+#endif
+
+        AvaloniaAppHost.Run(args);
+    }
+
+    // Avalonia configuration, don't remove; also used by visual designer.
+    public static AppBuilder BuildAvaloniaApp()
+        => AvaloniaAppHost.BuildAvaloniaApp();
+}

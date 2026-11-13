@@ -1,0 +1,529 @@
+using System.Collections.Concurrent;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.Tools;
+using UniGetUI.PackageEngine.Interfaces;
+
+namespace UniGetUI.PackageEngine.PackageLoader
+{
+    public class PackagesChangedEvent
+    {
+        public PackagesChangedEvent(
+            bool proceduralChange,
+            IReadOnlyList<IPackage> addedPackages,
+            IReadOnlyList<IPackage> removedPackages
+        )
+        {
+            ProceduralChange = proceduralChange;
+            AddedPackages = addedPackages;
+            RemovedPackages = removedPackages;
+        }
+
+        public readonly bool ProceduralChange;
+        public readonly IReadOnlyList<IPackage> AddedPackages;
+        public readonly IReadOnlyList<IPackage> RemovedPackages;
+    }
+
+    public abstract class AbstractPackageLoader
+    {
+        /// <summary>
+        /// Checks if the loader has loaded packages
+        /// </summary>
+        public bool IsLoaded { get; private set; }
+
+        /// <summary>
+        /// Checks if the loader is fetching new packages right now
+        /// </summary>
+        public bool IsLoading { get; protected set; }
+
+        public bool LastLoadReportedFailures { get; private set; }
+
+        public bool HasPendingInitialLoad => !IsLoaded && !LastLoadReportedFailures;
+
+        public DateTime? LastLoadFinishedUtc { get; private set; }
+
+        private TaskCompletionSource? _loadCompletion;
+
+        private IReadOnlyDictionary<IPackageManager, TaskCompletionSource> _managerLoads =
+            new Dictionary<IPackageManager, TaskCompletionSource>();
+
+        public bool Any()
+        {
+            return !PackageReference.IsEmpty;
+        }
+
+        /// <summary>
+        /// The collection of currently available packages
+        /// </summary>
+        public List<IPackage> Packages
+        {
+            get => PackageReference.Values.ToList();
+        }
+
+        protected readonly ConcurrentDictionary<long, IPackage> PackageReference;
+
+        private readonly ConcurrentDictionary<long, (bool Checked, bool RequiresReinstall)> _rememberedSelection = new();
+
+        /// <summary>
+        /// Fires when a block of packages (one package or more) is added or removed to the loader
+        /// </summary>
+        public event EventHandler<PackagesChangedEvent>? PackagesChanged;
+
+        /// <summary>
+        /// Fires when the loader finishes fetching packages
+        /// </summary>
+        public event EventHandler<EventArgs>? FinishedLoading;
+
+        /// <summary>
+        /// Fires when the manager starts fetching packages
+        /// </summary>
+        public event EventHandler<EventArgs>? StartedLoading;
+
+        private readonly bool ALLOW_MULTIPLE_PACKAGE_VERSIONS;
+        private readonly bool DISABLE_RELOAD;
+        private readonly bool PACKAGES_CHECKED_BY_DEFAULT;
+        private readonly bool REQUIRES_INTERNET;
+        protected string LOADER_IDENTIFIER;
+        private int LoadOperationIdentifier;
+        protected IReadOnlyList<IPackageManager> Managers { get; private set; }
+
+        /// <summary>
+        /// True when at least one of this loader's managers is ready. When none is, a reload runs nothing
+        /// and an empty list says nothing about the packages on this device.
+        /// </summary>
+        public bool AnyManagerReady => Managers.Any(manager => manager.IsReady());
+
+        public AbstractPackageLoader(
+            IReadOnlyList<IPackageManager> managers,
+            string identifier,
+            bool AllowMultiplePackageVersions,
+            bool DisableReload,
+            bool CheckedBydefault,
+            bool RequiresInternet
+        )
+        {
+            Managers = managers;
+            PackageReference = new ConcurrentDictionary<long, IPackage>();
+            IsLoaded = false;
+            IsLoading = false;
+            PACKAGES_CHECKED_BY_DEFAULT = CheckedBydefault;
+            DISABLE_RELOAD = DisableReload;
+            ALLOW_MULTIPLE_PACKAGE_VERSIONS = AllowMultiplePackageVersions;
+            LOADER_IDENTIFIER = identifier;
+            ALLOW_MULTIPLE_PACKAGE_VERSIONS = AllowMultiplePackageVersions;
+            REQUIRES_INTERNET = RequiresInternet;
+        }
+
+        /// <summary>
+        /// Stops the current loading process
+        /// </summary>
+        public Task WaitForCurrentLoadAsync()
+        {
+            var completion = Volatile.Read(ref _loadCompletion);
+            return IsLoading && completion is not null ? completion.Task : Task.CompletedTask;
+        }
+
+        public Task WaitForManagerAsync(IPackageManager manager)
+        {
+            var managerLoads = Volatile.Read(ref _managerLoads);
+            return IsLoading && managerLoads.TryGetValue(manager, out var load)
+                ? load.Task
+                : Task.CompletedTask;
+        }
+
+        private static void CompleteManagerLoads(
+            IReadOnlyDictionary<IPackageManager, TaskCompletionSource> managerLoads
+        )
+        {
+            foreach (TaskCompletionSource load in managerLoads.Values)
+                load.TrySetResult();
+        }
+
+        private void CompleteCurrentLoad()
+        {
+            Interlocked.Exchange(ref _loadCompletion, null)?.TrySetResult();
+            CompleteManagerLoads(Volatile.Read(ref _managerLoads));
+        }
+
+        private void CompleteLoad(TaskCompletionSource completion)
+        {
+            Interlocked.CompareExchange(ref _loadCompletion, null, completion);
+            completion.TrySetResult();
+        }
+
+        protected virtual bool DidManagerReportFailure(IPackageManager manager) => false;
+
+        public void StopLoading(bool emitFinishSignal = true)
+        {
+            LoadOperationIdentifier = -1;
+            IsLoaded = false;
+            IsLoading = false;
+            CompleteCurrentLoad();
+            if (emitFinishSignal)
+                InvokeFinishedLoadingEvent();
+        }
+
+        protected void InvokePackagesChangedEvent(
+            bool proceduralChange,
+            IReadOnlyList<IPackage> toAdd,
+            IReadOnlyList<IPackage> toRemove
+        )
+        {
+            PackagesChanged?.Invoke(this, new(proceduralChange, toAdd, toRemove));
+        }
+
+        protected void InvokeStartedLoadingEvent()
+        {
+            StartedLoading?.Invoke(this, EventArgs.Empty);
+        }
+
+        protected void InvokeFinishedLoadingEvent()
+        {
+            FinishedLoading?.Invoke(this, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// Will trigger a forceful reload of the packages
+        /// </summary>
+        public virtual async Task ReloadPackages()
+        {
+            TaskCompletionSource? completion = null;
+            Dictionary<IPackageManager, TaskCompletionSource>? managerLoads = null;
+            int current_identifier = 0;
+            bool finishWasAnnounced = false;
+            try
+            {
+                if (DISABLE_RELOAD)
+                {
+                    InvokePackagesChangedEvent(false, [], []);
+                    return;
+                }
+
+                if (IsLoading)
+                {
+                    Logger.Debug($"[{this.GetType()}] Packages are already being loaded!!!");
+                    return;
+                }
+
+                LoadOperationIdentifier = new Random().Next();
+                current_identifier = LoadOperationIdentifier;
+                completion = new TaskCompletionSource(
+                    TaskCreationOptions.RunContinuationsAsynchronously
+                );
+                Volatile.Write(ref _loadCompletion, completion);
+                managerLoads = Managers.Distinct().ToDictionary(
+                    manager => manager,
+                    _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+                );
+                Volatile.Write(ref _managerLoads, managerLoads);
+                IsLoading = true;
+                LastLoadReportedFailures = false;
+                StartedLoading?.Invoke(this, EventArgs.Empty);
+
+                RememberSelectionState();
+
+                // Clear packages only after signaling the load started, so the UI shows the
+                // loading state instead of briefly flashing the "no packages found" message.
+                PackageReference.Clear();
+                IsLoaded = false;
+                InvokePackagesChangedEvent(false, [], []);
+
+                if (REQUIRES_INTERNET && WillQueryAnyManager())
+                {
+                    await CoreTools.WaitForInternetConnection();
+                }
+
+                List<Task<IReadOnlyList<IPackage>>> tasks = [];
+                Dictionary<Task<IReadOnlyList<IPackage>>, IPackageManager> taskManagers = [];
+
+                foreach (IPackageManager manager in Managers)
+                {
+                    if (manager.IsReady())
+                    {
+                        Task<IReadOnlyList<IPackage>> task = Task.Run(async () =>
+                        {
+                            await WaitBeforeLoadingFromManagerAsync(manager);
+                            return LoadPackagesFromManager(manager);
+                        });
+                        tasks.Add(task);
+                        taskManagers[task] = manager;
+                    }
+                    else
+                    {
+                        managerLoads[manager].TrySetResult();
+                    }
+                }
+
+                while (tasks.Count > 0)
+                {
+                    foreach (Task<IReadOnlyList<IPackage>> task in tasks.ToArray())
+                    {
+                        if (!task.IsCompleted)
+                        {
+                            await Task.Delay(100).ConfigureAwait(false);
+                        }
+
+                        if (task.IsCompleted)
+                        {
+                            if (task.IsFaulted || task.IsCanceled)
+                                LastLoadReportedFailures = true;
+
+                            if (
+                                LoadOperationIdentifier == current_identifier
+                                && task.IsCompletedSuccessfully
+                            )
+                            {
+                                var toAdd = new List<IPackage>();
+                                foreach (IPackage package in task.Result)
+                                {
+                                    if (Contains(package) || !await IsPackageValid(package))
+                                    {
+                                        continue;
+                                    }
+
+                                    toAdd.Add(package);
+                                    await AddPackage(package, restoreSelection: true);
+                                }
+
+                                InvokePackagesChangedEvent(true, toAdd, []);
+                            }
+
+                            managerLoads[taskManagers[task]].TrySetResult();
+                            tasks.Remove(task);
+                        }
+                    }
+                }
+
+                foreach (IPackageManager manager in Managers)
+                {
+                    if (manager.IsReady() && DidManagerReportFailure(manager))
+                        LastLoadReportedFailures = true;
+                }
+
+                IsLoading = false;
+
+                if (LoadOperationIdentifier == current_identifier)
+                {
+                    LastLoadFinishedUtc = DateTime.UtcNow;
+                    IsLoaded = true;
+                    finishWasAnnounced = true;
+                    InvokeFinishedLoadingEvent();
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error(ex);
+
+                if (
+                    !finishWasAnnounced
+                    && completion is not null
+                    && LoadOperationIdentifier == current_identifier
+                )
+                {
+                    LastLoadReportedFailures = true;
+                    IsLoading = false;
+
+                    try
+                    {
+                        InvokeFinishedLoadingEvent();
+                    }
+                    catch (Exception announceEx)
+                    {
+                        Logger.Error(announceEx);
+                    }
+                }
+            }
+            finally
+            {
+                if (managerLoads is not null)
+                    CompleteManagerLoads(managerLoads);
+                if (completion is not null)
+                    CompleteLoad(completion);
+            }
+        }
+
+        /// <summary>
+        /// Resets the packages available on the loader
+        /// </summary>
+        public void ClearPackages(bool emitFinishSignal = true)
+        {
+            StopLoading(emitFinishSignal);
+            PackageReference.Clear();
+            IsLoaded = false;
+            IsLoading = false;
+            InvokePackagesChangedEvent(false, [], []);
+        }
+
+        protected virtual bool WillQueryAnyManager() => true;
+
+        protected virtual Task WaitBeforeLoadingFromManagerAsync(IPackageManager manager) =>
+            Task.CompletedTask;
+
+        /// <summary>
+        /// Loads the packages from the given manager
+        /// </summary>
+        /// <param name="manager">The manager from which to load packages</param>
+        /// <returns>A task that will load the packages</returns>
+        protected abstract IReadOnlyList<IPackage> LoadPackagesFromManager(IPackageManager manager);
+
+        /// <summary>
+        /// Checks whether the package is valid or must be skipped
+        /// </summary>
+        /// <param name="package">The package to check</param>
+        /// <returns>True if the package can be added, false otherwise</returns>
+        protected abstract Task<bool> IsPackageValid(IPackage package);
+
+        /// <summary>
+        /// A method to post-process packages after they have been added.
+        /// </summary>
+        /// <param name="package">The package to process</param>
+        protected abstract Task WhenAddingPackage(IPackage package);
+
+        /// <summary>
+        /// Checks whether a package is contained on the current Loader
+        /// </summary>
+        /// <param name="package">The package to check against</param>
+        public bool Contains(IPackage package)
+        {
+            return PackageReference.ContainsKey(HashPackage(package));
+        }
+
+        /// <summary>
+        /// Returns the appropriate hash of the package, according to the current loader configuration
+        /// </summary>
+        /// <param name="package">The package to hash</param>
+        /// <returns>A long int containing the hash</returns>
+        protected long HashPackage(IPackage package)
+        {
+            return ALLOW_MULTIPLE_PACKAGE_VERSIONS ? package.GetVersionedHash() : package.GetHash();
+        }
+
+        private void RememberSelectionState()
+        {
+            _rememberedSelection.Clear();
+            foreach (var entry in PackageReference)
+            {
+                _rememberedSelection[entry.Key] = (
+                    entry.Value.IsChecked,
+                    entry.Value.RequiresReinstallToUpdate
+                );
+            }
+        }
+
+        protected async Task AddPackage(IPackage package, bool restoreSelection = false)
+        {
+            if (Contains(package))
+                return;
+
+            package.IsChecked =
+                restoreSelection
+                && _rememberedSelection.TryGetValue(HashPackage(package), out var remembered)
+                && (remembered.RequiresReinstall || !package.RequiresReinstallToUpdate)
+                    ? remembered.Checked
+                    : PACKAGES_CHECKED_BY_DEFAULT && !package.RequiresReinstallToUpdate;
+            await WhenAddingPackage(package);
+            PackageReference.TryAdd(HashPackage(package), package);
+        }
+
+        /// <summary>
+        /// Adds a foreign package to the current loader. Perhaps a package has been recently installed and it needs to be added to the installed packages loader
+        /// </summary>
+        /// <param name="package">The package to add</param>
+        public async Task AddForeign(IPackage? package)
+        {
+            if (package is null)
+            {
+                return;
+            }
+
+            await AddPackage(package);
+            InvokePackagesChangedEvent(true, [package], []);
+        }
+
+        /// <summary>
+        /// Removes the given package from the list.
+        /// </summary>
+        public void Remove(IPackage? package)
+        {
+            if (package is null)
+            {
+                return;
+            }
+
+            if (Contains(package))
+            {
+                PackageReference.Remove(HashPackage(package), out _);
+                InvokePackagesChangedEvent(true, [], [package]);
+                return;
+            }
+
+            if (FindFromAnySource(package) is { } stored)
+            {
+                PackageReference.Remove(HashPackage(stored), out _);
+                InvokePackagesChangedEvent(true, [], [stored]);
+            }
+        }
+
+        /// <summary>
+        /// Gets the corresponding package on the current loader.
+        /// This method follows the equivalence settings for this loader
+        /// </summary>
+        /// <returns>A Package? object</returns>
+        public IPackage? GetEquivalentPackage(IPackage? package)
+        {
+            if (package is null)
+            {
+                return null;
+            }
+
+            if (PackageReference.TryGetValue(HashPackage(package), out IPackage? eq))
+                return eq;
+
+            return FindFromAnySource(package);
+        }
+
+        private IPackage? FindFromAnySource(IPackage package)
+        {
+            if (package.Manager.Capabilities.InstalledPackagesKeepTheirSource)
+                return null;
+
+            return Packages.FirstOrDefault(candidate =>
+                PackageIdentity.IsSamePackageFromAnySource(candidate, package)
+                && (!ALLOW_MULTIPLE_PACKAGE_VERSIONS || candidate.VersionString == package.VersionString)
+            );
+        }
+
+        /// <summary>
+        /// Gets ALL of the equivalent packages on this loader.
+        /// This method does NOT follow the equivalence settings for this loader
+        /// </summary>
+        /// <param name="package">The package for which to find the equivalent packages</param>
+        /// <returns>A IReadOnlyList<Package> object</returns>
+        public IReadOnlyList<IPackage> GetEquivalentPackages(IPackage? package)
+        {
+            if (package is null)
+            {
+                return [];
+            }
+
+            return Packages.Where(p => p.IsSamePackageAs(package)).ToArray();
+        }
+
+        public IPackage? GetPackageForId(string id, string? sourceName = null)
+        {
+            foreach (IPackage package in Packages)
+            {
+                if (package.Id == id && (sourceName is null || package.Source.Name == sourceName))
+                {
+                    return package;
+                }
+            }
+
+            return null;
+        }
+
+        public int Count()
+        {
+            return PackageReference.Count;
+        }
+    }
+}

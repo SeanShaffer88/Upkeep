@@ -1,0 +1,223 @@
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Platform;
+using Avalonia.Styling;
+using Avalonia.Threading;
+using UniGetUI.Avalonia.Views;
+using UniGetUI.Core.Data;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.SettingsEngine;
+using UniGetUI.Core.Tools;
+using UniGetUI.PackageEngine.Enums;
+using UniGetUI.PackageEngine.Operations.Reboot;
+using UniGetUI.PackageEngine.PackageLoader;
+
+namespace UniGetUI.Avalonia.Infrastructure;
+
+internal sealed class TrayService : IDisposable
+{
+    private readonly TrayIcon _trayIcon;
+    private readonly NativeMenuItem _restartComputerItem;
+    private string _lastIconUri = "";
+
+    public TrayService(MainWindow owner)
+    {
+        _restartComputerItem = new NativeMenuItem(CoreTools.Translate("Restart computer"))
+        {
+            IsVisible = false,
+        };
+        _restartComputerItem.Click += (_, _) => Dispatcher.UIThread.Post(() =>
+        {
+            owner.ShowFromTray();
+            _ = SystemRestartService.ConfirmAndRestartAsync(owner);
+        });
+
+        _trayIcon = new TrayIcon
+        {
+            ToolTipText = "Upkeep",
+            Menu = BuildMenu(owner, _restartComputerItem),
+        };
+
+        // macOS tints the menu bar from the wallpaper, not from the system appearance, so no theme
+        // check can pick the right glyph; a template icon is masked and tinted by macOS itself.
+        if (OperatingSystem.IsMacOS())
+        {
+            MacOSProperties.SetIsTemplateIcon(_trayIcon, true);
+        }
+
+        PendingRebootStore.Changed += OnPendingRebootStoreChanged;
+        if (Application.Current?.PlatformSettings is { } platformSettings)
+        {
+            platformSettings.ColorValuesChanged += OnPlatformColorValuesChanged;
+        }
+
+        _trayIcon.Clicked += (_, _) => Dispatcher.UIThread.Post(() => owner.ShowFromTray());
+
+        var app = Application.Current!;
+        var icons = TrayIcon.GetIcons(app) ?? new TrayIcons();
+        icons.Add(_trayIcon);
+        TrayIcon.SetIcons(app, icons);
+    }
+
+    public void UpdateStatus()
+    {
+        try
+        {
+            _trayIcon.IsVisible = Settings.IsSystemTrayIconVisible();
+
+            string status;
+            string tooltip;
+
+            bool anyRunning = AvaloniaOperationRegistry.Operations.Any(
+                o => o.Status is OperationStatus.Running or OperationStatus.InQueue);
+
+            int updatesCount = UpgradablePackagesLoader.Instance?.Count() ?? 0;
+
+            int rebootPendingCount = PendingRebootStore.PendingCount;
+            bool appRestartRequired = AvaloniaOperationRegistry.AppRestartRequired;
+
+            _restartComputerItem.IsVisible = rebootPendingCount > 0;
+            _restartComputerItem.Header = rebootPendingCount switch
+            {
+                0 => CoreTools.Translate("Restart computer"),
+                1 => CoreTools.Translate("Restart computer (1 package pending)"),
+                _ => CoreTools.Translate("Restart computer ({0} packages pending)", rebootPendingCount),
+            };
+
+            if (anyRunning)
+            {
+                status = "blue";
+                tooltip = CoreTools.Translate("Operation in progress");
+            }
+            else if (AvaloniaOperationRegistry.ErrorsOccurred > 0)
+            {
+                status = "orange";
+                tooltip = CoreTools.Translate("Attention required");
+            }
+            else if (rebootPendingCount > 0 || appRestartRequired)
+            {
+                status = "turquoise";
+                tooltip = (rebootPendingCount, appRestartRequired) switch
+                {
+                    (0, _) => CoreTools.Translate("Restart Upkeep to fully apply changes"),
+                    (1, false) => CoreTools.Translate(
+                        "1 package is waiting for your computer to restart"),
+                    (_, false) => CoreTools.Translate(
+                        "{0} packages are waiting for your computer to restart", rebootPendingCount),
+                    _ => CoreTools.Translate("Upkeep and your computer both need to be restarted"),
+                };
+            }
+            else if (updatesCount > 0)
+            {
+                status = "green";
+                tooltip = updatesCount == 1
+                    ? CoreTools.Translate("1 update is available")
+                    : CoreTools.Translate("{0} updates are available", updatesCount);
+            }
+            else
+            {
+                status = "empty";
+                tooltip = CoreTools.Translate("Everything is up to date");
+            }
+
+            _trayIcon.ToolTipText = tooltip + " - Upkeep";
+
+            bool light = IsTaskbarLight();
+            string tone = light ? "_black" : "_white";
+
+            string uri = $"avares://UniGetUI/Assets/tray_{status}{tone}_legacy.ico";
+
+            if (_lastIconUri == uri) return;
+            _lastIconUri = uri;
+
+            using var stream = AssetLoader.Open(new Uri(uri));
+            _trayIcon.Icon = new WindowIcon(stream);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("Failed to update tray icon status:");
+            Logger.Error(ex);
+        }
+    }
+
+    private static bool IsTaskbarLight()
+    {
+#if WINDOWS
+        // On Windows, read the registry to match the taskbar background colour.
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            return key?.GetValue("SystemUsesLightTheme") is int v && v > 0;
+        }
+        catch
+        {
+            return false;
+        }
+#else
+        // macOS: the icon is a template (see the constructor), only its alpha is used.
+        if (OperatingSystem.IsMacOS())
+        {
+            return true;
+        }
+
+        // The Linux panel follows the desktop appearance, not UniGetUI's own theme.
+        var app = Application.Current;
+        PlatformThemeVariant? osVariant = app?.PlatformSettings?.GetColorValues().ThemeVariant;
+        if (osVariant is not null)
+        {
+            return osVariant == PlatformThemeVariant.Light;
+        }
+
+        return app?.ActualThemeVariant == ThemeVariant.Light;
+#endif
+    }
+
+    private void OnPendingRebootStoreChanged(object? sender, EventArgs e)
+        => Dispatcher.UIThread.Post(UpdateStatus);
+
+    private void OnPlatformColorValuesChanged(object? sender, PlatformColorValues e)
+        => Dispatcher.UIThread.Post(UpdateStatus);
+
+    private static NativeMenu BuildMenu(MainWindow owner, NativeMenuItem restartComputerItem)
+    {
+        var menu = new NativeMenu();
+
+        var updates = new NativeMenuItem(CoreTools.Translate("Software Updates"));
+        updates.Click += (_, _) => Dispatcher.UIThread.Post(() => { owner.Navigate(PageType.Updates); owner.ShowFromTray(); });
+        menu.Add(updates);
+        menu.Add(restartComputerItem);
+        menu.Add(new NativeMenuItemSeparator());
+
+        menu.Add(new NativeMenuItem(
+            CoreTools.Translate("Upkeep Version {0}", CoreData.VersionName))
+        {
+            IsEnabled = false,
+        });
+        menu.Add(new NativeMenuItemSeparator());
+
+        var show = new NativeMenuItem(CoreTools.Translate("Show Upkeep"));
+        show.Click += (_, _) => Dispatcher.UIThread.Post(() => owner.ShowFromTray());
+        menu.Add(show);
+
+        var quit = new NativeMenuItem(CoreTools.Translate("Quit"));
+        quit.Click += (_, _) => Dispatcher.UIThread.Post(() => owner.QuitApplication());
+        menu.Add(quit);
+
+        return menu;
+    }
+
+    public void Dispose()
+    {
+        PendingRebootStore.Changed -= OnPendingRebootStoreChanged;
+        var app = Application.Current;
+        if (app?.PlatformSettings is { } platformSettings)
+        {
+            platformSettings.ColorValuesChanged -= OnPlatformColorValuesChanged;
+        }
+
+        if (app is not null)
+            TrayIcon.GetIcons(app)?.Remove(_trayIcon);
+        _trayIcon.Dispose();
+    }
+}

@@ -1,0 +1,560 @@
+using System.Diagnostics;
+using Avalonia.Controls;
+using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Avalonia.ViewModels.Pages;
+using UniGetUI.Avalonia.Views;
+using UniGetUI.Avalonia.Views.Pages.SettingsPages;
+using UniGetUI.Core.Data;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.SettingsEngine;
+using UniGetUI.Core.Tools;
+using UniGetUI.Core.Tools.Scheduling;
+using UniGetUI.Interface.Enums;
+using UniGetUI.Interface.Telemetry;
+using UniGetUI.PackageEngine.Classes.Manager.Classes;
+using UniGetUI.PackageEngine.Classes.Packages.Classes;
+using UniGetUI.PackageEngine.Enums;
+using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.Operations;
+using UniGetUI.PackageEngine.PackageClasses;
+using UniGetUI.PackageEngine.PackageLoader;
+
+namespace UniGetUI.Avalonia.Views.Pages;
+
+public class SoftwareUpdatesPage : AbstractPackagesPage
+{
+    // Context-menu items whose enabled state depends on the focused package
+    private MenuItem? _menuAsAdmin;
+    private MenuItem? _menuInteractive;
+    private MenuItem? _menuSkipHash;
+    private MenuItem? _menuOpenInstallLocation;
+    private MenuItem? _menuReleaseNotes;
+    private IPackage? _releaseNotesPackage;
+    private MenuItem? _menuManual;
+
+    public SoftwareUpdatesPage() : base(new PackagesPageData
+    {
+        PageName = "SoftwarePages.SoftwareUpdatesPage",
+        PageTitle = CoreTools.Translate("Software Updates"),
+        IconName = "update",
+        PageRole = OperationType.Update,
+        Loader = UpgradablePackagesLoader.Instance ?? new UpgradablePackagesLoader([]),
+        MegaQueryBlockEnabled = false,
+        DisableSuggestedResultsRadio = true,
+        PackagesAreCheckedByDefault = true,
+        ShowLastLoadTime = true,
+        DisableAutomaticPackageLoadOnStart = false,
+        DisableFilterOnQueryChange = false,
+        DisableReload = false,
+        NoPackages_BackgroundText = CoreTools.Translate("Hooray! No updates were found."),
+        NoPackages_ImagePath = "avares://UniGetUI/Assets/Images/Trophee.png",
+        NoPackages_SourcesText = CoreTools.Translate("Everything is up to date"),
+        NoPackages_SubtitleText_Base = CoreTools.Translate("Everything is up to date"),
+        MainSubtitle_StillLoading = CoreTools.Translate("Loading packages"),
+        NoMatches_BackgroundText = CoreTools.Translate("No results were found matching the input criteria"),
+    })
+    {
+        ViewModel.PackagesLoaded += reason => { _ = WhenPackagesLoaded(); };
+        if (UpgradablePackagesLoader.Instance is { } upgradableLoader)
+        {
+            upgradableLoader.PackagesChanged += (_, e) =>
+            {
+                if (OperatingSystem.IsWindows() && e.RemovedPackages.Count > 0 && !upgradableLoader.IsLoading && !upgradableLoader.Any())
+                    WindowsAppNotificationBridge.RemoveUpdatesAvailableNotification();
+            };
+        }
+    }
+
+    protected override void GenerateToolBar(PackagesPageViewModel vm)
+    {
+        // ── Dropdown: update variants ───────────────────────────────────────
+        var updateAsAdmin = new MenuItem { Header = CoreTools.Translate("Update as administrator"), IsVisible = OperatingSystem.IsWindows() };
+        var updateSkipHash = new MenuItem { Header = CoreTools.Translate("Skip integrity checks") };
+        var updateInteractive = new MenuItem { Header = CoreTools.Translate("Interactive update") };
+        SetMainButton("update", CoreTools.Translate("Update selection"), () =>
+            _ = LaunchUpdate(vm.FilteredPackages.GetCheckedPackages()));
+
+        EnableMainButtonWhenPackagesChecked();
+        SetMainButtonDropdown(new MenuFlyout
+        {
+            Items =
+            {
+                updateAsAdmin, updateSkipHash, updateInteractive,
+            },
+        });
+
+        updateAsAdmin.Click += (_, _) => _ = LaunchUpdate(vm.FilteredPackages.GetCheckedPackages(), elevated: true);
+        updateSkipHash.Click += (_, _) => _ = LaunchUpdate(vm.FilteredPackages.GetCheckedPackages(), no_integrity: true);
+        updateInteractive.Click += (_, _) => _ = LaunchUpdate(vm.FilteredPackages.GetCheckedPackages(), interactive: true);
+        // ── Toolbar buttons ─────────────────────────────────────────────────
+        ViewModel.AddToolbarSeparator(subgroup: !ViewModel.DisableReload);
+        EnableWhen(ViewModel.AddToolbarButton("options", CoreTools.Translate("Update options"),
+            () => _ = ShowInstallationOptionsForPackage(SelectedItem), showLabel: false), () => HasSelectedItem);
+        ViewModel.AddToolbarSeparator(subgroup: true);
+        EnableWhen(ViewModel.AddToolbarButton("console", CoreTools.Translate("Manual update"),
+            () => _ = ManualInstallHelper.LaunchManualAsync(SelectedItem, OperationType.Update)), () => HasSelectedItem);
+        ViewModel.AddToolbarSeparator(subgroup: true);
+        EnableWhen(ViewModel.AddToolbarButton("info_round", CoreTools.Translate("Package details"),
+            () => _ = ShowDetailsForPackage(SelectedItem), showLabel: false), () => HasSelectedItem);
+        ViewModel.AddToolbarSeparator();
+        var ignoreButton = ViewModel.AddToolbarButton("pin", CoreTools.Translate("Ignore selected packages"), async () =>
+        {
+            var packages = vm.FilteredPackages.GetCheckedPackages().ToList();
+            if (MainWindow.Instance is not { } window
+                || !await IgnoreUpdatesConfirmationDialog.ConfirmAsync(window, packages)) return;
+            foreach (var pkg in packages)
+            {
+                await pkg.AddToIgnoredUpdatesAsync();
+                UpgradablePackagesLoader.Instance.Remove(pkg);
+                UpgradablePackagesLoader.Instance.IgnoredPackages[pkg.Id] = pkg;
+            }
+        });
+        EnableWhen(ignoreButton, () => HasCheckedPackages);
+        ViewModel.AddToolbarButton("clipboard_list", CoreTools.Translate("Manage ignored updates"),
+            () => vm.RequestManageIgnoredCommand.Execute(null));
+        ViewModel.AddToolbarSeparator(subgroup: true);
+        ViewModel.AddToolbarButton("save_as", CoreTools.Translate("Export to CSV"),
+            () => _ = ExportPackagesToCsvAsync());
+        ViewModel.AddToolbarButton("settings", CoreTools.Translate("Update settings"), () =>
+        {
+            if (MainWindow.Instance?.DataContext is UniGetUI.Avalonia.ViewModels.MainWindowViewModel mainWindow)
+                mainWindow.OpenSettingsPage(typeof(Updates));
+        });
+        ViewModel.AddToolbarButton("folder", CoreTools.Translate("Scan portable apps"), () =>
+        {
+            if (MainWindow.Instance is { } owner)
+                _ = new PortableAppsScanWindow().ShowDialog(owner);
+        });
+        ViewModel.AddToolbarButton("history", CoreTools.Translate("Operation history"), () =>
+        {
+            if (MainWindow.Instance?.DataContext is UniGetUI.Avalonia.ViewModels.MainWindowViewModel mainWindow)
+                mainWindow.NavigateTo(PageType.OperationHistory);
+        });
+        ViewModel.AddToolbarButton("save_as", CoreTools.Translate("Export inventory"), () =>
+        {
+            if (MainWindow.Instance is { } owner)
+                _ = ApplicationInventoryTools.ExportAsync(owner);
+        });
+        ViewModel.AddToolbarButton("compare", CoreTools.Translate("Compare inventory"), () =>
+        {
+            if (MainWindow.Instance is { } owner)
+                _ = ApplicationInventoryTools.CompareAsync(owner);
+        });
+    }
+
+    // ─── Context menu ─────────────────────────────────────────────────────────
+    protected override ContextMenu? GenerateContextMenu()
+    {
+        var menuUpdate = new MenuItem
+        {
+            Header = ShortcutHeader(CoreTools.Translate("Update"), MainActionShortcut),
+            Icon = LoadMenuIcon("update"),
+        };
+        menuUpdate.Click += (_, _) => _ = LaunchUpdate([SelectedItem!]);
+
+        var menuUpdateOptions = new MenuItem
+        {
+            Header = ShortcutHeader(CoreTools.Translate("Update options"), OptionsShortcut),
+            Icon = LoadMenuIcon("options"),
+        };
+        menuUpdateOptions.Click += (_, _) => _ = ShowInstallationOptionsForPackage(SelectedItem);
+
+        _menuManual = new MenuItem { Header = CoreTools.Translate("Manual update"), Icon = LoadMenuIcon("console") };
+        _menuManual.Click += (_, _) => _ = ManualInstallHelper.LaunchManualAsync(SelectedItem, OperationType.Update);
+
+        _menuOpenInstallLocation = new MenuItem
+        {
+            Header = CoreTools.Translate("Open install location"),
+            Icon = LoadMenuIcon("launch"),
+        };
+        _menuOpenInstallLocation.Click += (_, _) => OpenInstallLocation(SelectedItem);
+
+        _menuAsAdmin = new MenuItem
+        {
+            Header = CoreTools.Translate("Update as administrator"),
+            Icon = LoadMenuIcon("uac"),
+            IsVisible = OperatingSystem.IsWindows(),
+        };
+        _menuAsAdmin.Click += (_, _) => _ = LaunchUpdate([SelectedItem!], elevated: true);
+
+        _menuInteractive = new MenuItem
+        {
+            Header = CoreTools.Translate("Interactive update"),
+            Icon = LoadMenuIcon("interactive"),
+        };
+        _menuInteractive.Click += (_, _) => _ = LaunchUpdate([SelectedItem!], interactive: true);
+
+        _menuSkipHash = new MenuItem
+        {
+            Header = CoreTools.Translate("Skip hash check"),
+            Icon = LoadMenuIcon("checksum"),
+        };
+        _menuSkipHash.Click += (_, _) => _ = LaunchUpdate([SelectedItem!], no_integrity: true);
+
+        var menuIgnore = new MenuItem
+        {
+            Header = CoreTools.Translate("Ignore updates for this package"),
+            Icon = LoadMenuIcon("pin"),
+        };
+        menuIgnore.Click += (_, _) =>
+        {
+            var pkg = SelectedItem;
+            if (pkg is null) return;
+            _ = pkg.AddToIgnoredUpdatesAsync();
+            UpgradablePackagesLoader.Instance.Remove(pkg);
+            UpgradablePackagesLoader.Instance.IgnoredPackages[pkg.Id] = pkg;
+        };
+
+        var menuSkipVersion = new MenuItem
+        {
+            Header = CoreTools.Translate("Skip this version"),
+            Icon = LoadMenuIcon("skip"),
+        };
+        menuSkipVersion.Click += (_, _) =>
+        {
+            var pkg = SelectedItem;
+            if (pkg is null) return;
+            _ = pkg.AddToIgnoredUpdatesAsync(pkg.NewVersionString);
+            UpgradablePackagesLoader.Instance.Remove(pkg);
+            UpgradablePackagesLoader.Instance.IgnoredPackages[pkg.Id] = pkg;
+        };
+
+        // ── Pause updates submenu ──────────────────────────────────────────
+        var menuPause = new MenuItem
+        {
+            Header = CoreTools.Translate("Pause updates for"),
+            Icon = LoadMenuIcon("sandclock"),
+        };
+        foreach (var pauseTime in new[]
+        {
+            new IgnoredUpdatesDatabase.PauseTime { Days  = 1  },
+            new IgnoredUpdatesDatabase.PauseTime { Days  = 3  },
+            new IgnoredUpdatesDatabase.PauseTime { Weeks = 1  },
+            new IgnoredUpdatesDatabase.PauseTime { Weeks = 2  },
+            new IgnoredUpdatesDatabase.PauseTime { Weeks = 4  },
+            new IgnoredUpdatesDatabase.PauseTime { Months = 3 },
+            new IgnoredUpdatesDatabase.PauseTime { Months = 6 },
+            new IgnoredUpdatesDatabase.PauseTime { Months = 12},
+        })
+        {
+            var t = pauseTime;
+            var item = new MenuItem { Header = t.StringRepresentation() };
+            item.Click += (_, _) =>
+            {
+                var pkg = SelectedItem;
+                if (pkg is null) return;
+                _ = pkg.AddToIgnoredUpdatesAsync("<" + t.GetDateFromNow());
+                UpgradablePackagesLoader.Instance.IgnoredPackages[pkg.Id] = pkg;
+                UpgradablePackagesLoader.Instance.Remove(pkg);
+            };
+            menuPause.Items.Add(item);
+        }
+
+        var menuDetails = new MenuItem
+        {
+            Header = ShortcutHeader(CoreTools.Translate("Package details"), DetailsShortcut),
+            Icon = LoadMenuIcon("info_round"),
+        };
+        menuDetails.Click += (_, _) => _ = ShowDetailsForPackage(SelectedItem);
+
+        _menuReleaseNotes = new MenuItem
+        {
+            Header = CoreTools.Translate("Release notes"),
+            Icon = LoadMenuIcon("megaphone"),
+        };
+        _menuReleaseNotes.Click += (_, _) => _ = ShowReleaseNotesForPackage(SelectedItem);
+
+        var menu = new ContextMenu();
+        menu.Items.Add(menuUpdate);
+        menu.Items.Add(new Separator());
+        menu.Items.Add(menuUpdateOptions);
+        menu.Items.Add(_menuManual);
+        menu.Items.Add(_menuOpenInstallLocation);
+        menu.Items.Add(new Separator());
+        menu.Items.Add(_menuAsAdmin);
+        menu.Items.Add(_menuInteractive);
+        menu.Items.Add(_menuSkipHash);
+        menu.Items.Add(new Separator());
+        menu.Items.Add(menuIgnore);
+        menu.Items.Add(menuSkipVersion);
+        menu.Items.Add(menuPause);
+        menu.Items.Add(new Separator());
+        menu.Items.Add(_menuReleaseNotes);
+        menu.Items.Add(menuDetails);
+
+        return menu;
+    }
+
+    protected override void WhenShowingContextMenu(IPackage package)
+    {
+        if (_menuAsAdmin is null || _menuInteractive is null || _menuSkipHash is null
+            || _menuOpenInstallLocation is null
+            || _menuReleaseNotes is null || _menuManual is null)
+        {
+            Logger.Warn("Context menu items are null on SoftwareUpdatesPage");
+            return;
+        }
+
+        var caps = package.Manager.Capabilities;
+        _menuAsAdmin.IsEnabled = caps.CanRunAsAdmin;
+        _menuInteractive.IsEnabled = caps.CanRunInteractively;
+        _menuSkipHash.IsEnabled = caps.CanSkipIntegrityChecks;
+        _menuOpenInstallLocation.IsEnabled =
+            package.Manager.DetailsHelper.GetInstallLocation(package) is not null;
+
+        _releaseNotesPackage = package;
+        if (!caps.SupportsReleaseNotes)
+            _menuReleaseNotes.IsEnabled = false;
+        else if (package.Details.IsPopulated)
+            _menuReleaseNotes.IsEnabled = HasReleaseNotes(package.Details);
+        else
+        {
+            _menuReleaseNotes.IsEnabled = false;
+            _ = UpdateReleaseNotesAvailabilityAsync(package);
+        }
+    }
+
+    private async Task UpdateReleaseNotesAvailabilityAsync(IPackage package)
+    {
+        await package.Details.Load();
+        if (_menuReleaseNotes is not null && ReferenceEquals(_releaseNotesPackage, package))
+            _menuReleaseNotes.IsEnabled = HasReleaseNotes(package.Details);
+    }
+
+    private static bool HasReleaseNotes(IPackageDetails details) =>
+        GetReleaseNotesUrl(details) is not null || !string.IsNullOrWhiteSpace(details.ReleaseNotes);
+
+    private static Uri? GetReleaseNotesUrl(IPackageDetails details) =>
+        details.ReleaseNotesUrl is { IsAbsoluteUri: true } url
+        && (url.Scheme == Uri.UriSchemeHttps || url.Scheme == Uri.UriSchemeHttp)
+            ? url
+            : null;
+
+    // ─── Abstract action overrides ────────────────────────────────────────────
+    protected override void PerformMainPackageAction(IPackage? package)
+    {
+        if (package is null) return;
+        _ = LaunchUpdate([package]);
+    }
+
+    protected override bool SupportsDetailsPane => true;
+
+    protected override PackageDetailsWindow CreateDetailsPaneView(IPackage package) =>
+        new(package, OperationType.Update, TEL_InstallReferral.ALREADY_INSTALLED, embedded: true);
+
+    protected override async Task ShowDetailsForPackage(IPackage? package)
+    {
+        if (package is null) return;
+        if (GetMainWindow() is not { } win) return;
+
+        var dialog = new PackageDetailsWindow(
+            package, OperationType.Update, TEL_InstallReferral.ALREADY_INSTALLED);
+        await dialog.ShowDialog(win);
+
+        var update = await UpgradablePackagesLoader.Instance.ResolveSkippedMajorUpdateAsync(package);
+        if (dialog.ShouldProceedWithOperation && update is not null)
+            await LaunchUpdate([update]);
+    }
+
+    protected override async Task ShowInstallationOptionsForPackage(IPackage? package)
+    {
+        if (package is null || package.Source.IsVirtualManager) return;
+        var opts = await InstallOptionsFactory.LoadForPackageAsync(package);
+        if (GetMainWindow() is not { } win) return;
+
+        var dialog = new InstallOptionsWindow(package, OperationType.Update, opts);
+        await dialog.ShowDialog(win);
+        await InstallOptionsFactory.SaveForPackageAsync(opts, package);
+
+        var update = await UpgradablePackagesLoader.Instance.ResolveSkippedMajorUpdateAsync(package);
+        if (dialog.ShouldProceedWithOperation && update is not null)
+            await LaunchUpdate([update]);
+    }
+
+    // ─── Page-specific actions ────────────────────────────────────────────────
+
+    private static void OpenInstallLocation(IPackage? package)
+    {
+        if (package is null) return;
+        var path = package.Manager.DetailsHelper.GetInstallLocation(package);
+        if (path is not null)
+            Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+    }
+
+    private async Task ShowReleaseNotesForPackage(IPackage? package)
+    {
+        if (package is null) return;
+
+        if (!package.Details.IsPopulated)
+            await package.Details.Load();
+
+        if (GetReleaseNotesUrl(package.Details) is { } url)
+            CoreTools.Launch(url.AbsoluteUri);
+        else if (!string.IsNullOrWhiteSpace(package.Details.ReleaseNotes))
+            await ShowDetailsForPackage(package);
+    }
+
+    // ─── Operation launchers ──────────────────────────────────────────────────
+    internal static async Task<IReadOnlyList<UpdatePackageOperation>> LaunchUpdate(
+        IEnumerable<IPackage> packages,
+        bool? elevated = null,
+        bool? interactive = null,
+        bool? no_integrity = null,
+        bool background = false,
+        bool keepUpdatesPaused = false,
+        Action<UpdatePackageOperation>? beforeStart = null)
+    {
+        List<UpdatePackageOperation> started = [];
+        foreach (var listed in packages)
+        {
+            var pkg = keepUpdatesPaused
+                ? listed
+                : await UpgradablePackagesLoader.Instance.ResolveSkippedMajorUpdateAsync(listed);
+            if (pkg is null) continue;
+            var opts = await InstallOptionsFactory.LoadApplicableAsync(
+                pkg, elevated: elevated, interactive: interactive, no_integrity: no_integrity);
+            if (PackageOperation.HasPendingOperation(pkg, OperationType.Update)) continue;
+            if (background && PackageOperation.IsLeftOutOfBulkUpdates(pkg, opts)) continue;
+            var op = new UpdatePackageOperation(pkg, opts)
+            {
+                IsBackgroundOperation = background,
+                KeepUpdatesPaused = keepUpdatesPaused,
+            };
+            op.OperationSucceeded += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.SUCCESS);
+            op.OperationFailed += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.FAILED);
+            AvaloniaOperationRegistry.Add(op);
+            beforeStart?.Invoke(op);
+            _ = op.MainThread();
+            started.Add(op);
+        }
+
+        return started;
+    }
+
+    // ─── Auto-update on load ──────────────────────────────────────────────────
+
+    private static readonly OneTimeClaim UpdateAppsPassHandled = new();
+
+    private static async Task WhenPackagesLoaded()
+    {
+        try
+        {
+            bool shouldAutoInstall = MaintenanceScheduler.IsAutoInstallDue();
+            bool checkSucceeded = UpgradablePackagesLoader.Instance
+                is { IsLoaded: true, LastLoadReportedFailures: false, AnyManagerReady: true };
+            bool hasUpdateAppsArgument = CoreData.GetProcessArguments().Contains("--updateapps");
+
+            var upgradable = UpgradablePackagesLoader.Instance.Packages
+                .Where(p => p.Tag is not PackageTag.OnQueue and not PackageTag.BeingProcessed)
+                .ToList();
+
+            if (upgradable.Count == 0)
+            {
+                if (OperatingSystem.IsWindows() && checkSucceeded)
+                    WindowsAppNotificationBridge.RemoveUpdatesAvailableNotification();
+                bool firstUpdateAppsPass = AutomaticQuitMonitor.IsFirstUpdateAppsPass(
+                    hasUpdateAppsArgument, checkSucceeded, foundUpdates: false, UpdateAppsPassHandled);
+                if (AutomaticQuitMonitor.ShouldQuitAfterEmptyPass(checkSucceeded, shouldAutoInstall, firstUpdateAppsPass))
+                    QuitAfterAutomaticUpdates.QuitWhenOperationsFinish(nothingToInstall: true);
+                return;
+            }
+
+            if (Settings.Get(Settings.K.DisableAUPOnBattery) && PowerConditions.IsOnBattery())
+            {
+                Logger.Warn("Updates will not be installed automatically because the device is on battery.");
+                ShowAvailableUpdatesNotification(upgradable);
+            }
+            else if (Settings.Get(Settings.K.DisableAUPOnBatterySaver) && PowerConditions.IsBatterySaverOn())
+            {
+                Logger.Warn("Updates will not be installed automatically because battery saver is enabled.");
+                ShowAvailableUpdatesNotification(upgradable);
+            }
+            else if (Settings.Get(Settings.K.DisableAUPOnMeteredConnections) && PowerConditions.IsOnMeteredConnection())
+            {
+                Logger.Warn("Updates will not be installed automatically because the current internet connection is metered.");
+                ShowAvailableUpdatesNotification(upgradable);
+            }
+            else if (shouldAutoInstall)
+            {
+                MaintenanceScheduler.MarkAutoInstallHandled();
+                AutomaticQuitMonitor.IsFirstUpdateAppsPass(
+                    hasUpdateAppsArgument, checkSucceeded, foundUpdates: true, UpdateAppsPassHandled);
+                bool launched = await LaunchScheduledUpdate(upgradable);
+                if (AutomaticQuitMonitor.ShouldQuitAfterInstallPass(launched, checkSucceeded))
+                    QuitAfterAutomaticUpdates.QuitWhenOperationsFinish(nothingToInstall: !launched);
+            }
+            else if (hasUpdateAppsArgument)
+            {
+                bool firstUpdateAppsPass = AutomaticQuitMonitor.IsFirstUpdateAppsPass(
+                    hasUpdateAppsArgument, checkSucceeded, foundUpdates: true, UpdateAppsPassHandled);
+                var started = await AvaloniaPackageOperationHelper.UpdateAllAsync(background: true);
+                bool launched = started.Count > 0;
+                ShowUpgradingPackagesNotification(await PackageOperation.WithoutUpdatesLeftOutOfBulkAsync(upgradable));
+                Logger.Warn("Automatic install of updates has been enabled via Command Line (user settings have been overriden)");
+                if (firstUpdateAppsPass && AutomaticQuitMonitor.ShouldQuitAfterInstallPass(launched, checkSucceeded))
+                    QuitAfterAutomaticUpdates.QuitWhenOperationsFinish(nothingToInstall: !launched);
+                else if (launched)
+                    QuitAfterAutomaticUpdates.NoteUpdatesLaunched();
+            }
+            else
+            {
+                ShowAvailableUpdatesNotification(upgradable);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex);
+        }
+    }
+
+    private static async Task<bool> LaunchScheduledUpdate(IReadOnlyList<IPackage> upgradable)
+    {
+        bool markedOnly = MaintenanceScheduleStore.GetInstallTargets()
+            is ScheduleInstallTargets.MarkedPackagesOnly;
+
+        List<IPackage> candidates = [];
+        List<IPackage> skipped = [];
+        foreach (var package in upgradable)
+        {
+            if (!markedOnly || AutoUpdatesDatabase.IsAutoUpdated(package))
+                candidates.Add(package);
+            else
+                skipped.Add(package);
+        }
+
+        var targets = await PackageOperation.WithoutUpdatesLeftOutOfBulkAsync(candidates);
+        skipped.AddRange(candidates.Where(package => !targets.Contains(package, ReferenceEqualityComparer.Instance)));
+
+        if (targets.Count > 0)
+        {
+            await LaunchUpdate(targets, background: true);
+            ShowUpgradingPackagesNotification(targets);
+        }
+        else
+        {
+            Logger.Info("No upgradable package is marked for automatic updates, nothing will be installed");
+        }
+
+        if (skipped.Count > 0)
+            ShowAvailableUpdatesNotification(skipped);
+
+        return targets.Count > 0;
+    }
+
+    private static void ShowAvailableUpdatesNotification(IReadOnlyList<IPackage> upgradable)
+    {
+        if (OperatingSystem.IsWindows())
+            WindowsAppNotificationBridge.ShowUpdatesAvailableNotification(upgradable);
+        else if (OperatingSystem.IsMacOS())
+            MacOsNotificationBridge.ShowUpdatesAvailableNotification(upgradable);
+    }
+
+    private static void ShowUpgradingPackagesNotification(IReadOnlyList<IPackage> upgradable)
+    {
+        if (OperatingSystem.IsWindows())
+            WindowsAppNotificationBridge.ShowUpgradingPackagesNotification(upgradable);
+        else if (OperatingSystem.IsMacOS())
+            MacOsNotificationBridge.ShowUpgradingPackagesNotification(upgradable);
+    }
+
+}

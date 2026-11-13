@@ -1,0 +1,1255 @@
+using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using Avalonia;
+using Avalonia.Automation;
+using Avalonia.Collections;
+using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Threading;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Avalonia.ViewModels.Pages;
+using UniGetUI.Avalonia.Views;
+using UniGetUI.Avalonia.Views.DialogPages;
+using UniGetUI.Avalonia.Views.Pages;
+using UniGetUI.Avalonia.Views.Pages.LogPages;
+using UniGetUI.Avalonia.Views.Pages.SettingsPages;
+using UniGetUI.Core.Data;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.SettingsEngine;
+using UniGetUI.Core.Tools;
+using UniGetUI.Interface.Enums;
+using UniGetUI.PackageEngine;
+using UniGetUI.PackageEngine.Enums;
+using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.ManagerClasses.Classes;
+using UniGetUI.PackageEngine.Operations.Reboot;
+using UniGetUI.PackageEngine.PackageLoader;
+using UniGetUI.PackageOperations;
+
+namespace UniGetUI.Avalonia.ViewModels;
+
+public partial class MainWindowViewModel : ViewModelBase
+{
+    // ─── Pages ───────────────────────────────────────────────────────────────
+    private readonly DiscoverSoftwarePage DiscoverPage;
+    private readonly SoftwareUpdatesPage UpdatesPage;
+    private readonly InstalledPackagesPage InstalledPage;
+    private readonly PackageBundlesPage BundlesPage;
+    private SoftwareCatalogPage? CatalogPage;
+    private CatalogEditorPage? _catalogEditorPage;
+    public CatalogEditorViewModel? CatalogEditor { get; }
+    private readonly Dictionary<PageType, AppExtensionSession> _extensions = [];
+    public GitRepositoriesViewModel? GitRepositories { get; private set; }
+#if UNIGETUI_XCODE_EXTENSION
+    public XcodeViewModel? Xcode { get; private set; }
+    private XcodeAccountViewModel? _xcodeAccount;
+    public XcodeAccountViewModel XcodeAccount => _xcodeAccount ??= new(XcodeViewModel.SharedService);
+#endif
+    private SettingsBasePage? SettingsPage;
+    private SettingsBasePage? ManagersPage;
+    private UniGetUILogPage? UniGetUILogPage;
+    private ManagerLogsPage? ManagerLogPage;
+    private OperationHistoryPage? OperationHistoryPage;
+    private ManagerHealthPage? _managerHealthPage;
+    private HelpPage? HelpPage;
+    private ReleaseNotesPage? ReleaseNotesPage;
+
+    // ─── Navigation state ────────────────────────────────────────────────────
+    private PageType _oldPage = PageType.Null;
+    private PageType _currentPage = PageType.Null;
+    public PageType CurrentPage_t => _currentPage;
+    private readonly List<PageType> NavigationHistory = new();
+    private readonly SemaphoreSlim _navigationSemaphore = new(1, 1);
+
+    [ObservableProperty]
+    private object? _currentPageContent;
+
+    public event EventHandler<bool>? CanGoBackChanged;
+    public event EventHandler<PageType>? CurrentPageChanged;
+
+    [ObservableProperty]
+    private string _announcementText = "";
+
+    [ObservableProperty]
+    private AutomationLiveSetting _announcementLiveSetting = AutomationLiveSetting.Polite;
+
+    // ─── Operations panel ─────────────────────────────────────────────────────
+    public AvaloniaList<OperationViewModel> Operations => AvaloniaOperationRegistry.OperationViewModels;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ShowFailedOperationBadge))]
+    [NotifyPropertyChangedFor(nameof(OperationsSplitterVisible))]
+    private bool _operationsPanelVisible;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ShowFailedOperationBadge))]
+    [NotifyPropertyChangedFor(nameof(OperationsSplitterVisible))]
+    private bool _operationsPanelExpanded = true;
+
+    public bool OperationsSplitterVisible => OperationsPanelVisible && OperationsPanelExpanded;
+
+    private readonly List<AbstractOperation> _operationBatch = new();
+    private bool _batchSummaryShown;
+
+    public bool HasFailedOperations => Operations.Any(o => o.Operation.Status is OperationStatus.Failed);
+
+    public OperationViewModel? FirstFailedOperation =>
+        Operations.FirstOrDefault(o => o.Operation.Status is OperationStatus.Failed);
+
+    // Red badge on the chevron when the panel is collapsed and an operation failed
+    // (failures no longer pop a toast; expanded, the failure is already visible).
+    public bool ShowFailedOperationBadge => OperationsPanelVisible && !OperationsPanelExpanded && HasFailedOperations;
+
+    public string OperationsHeaderText
+    {
+        get
+        {
+            int total = _operationBatch.Count;
+            if (total == 0)
+                return CoreTools.Translate("Operations");
+            // Name the failures, so a collapsed panel does not read as "all good" when some failed.
+            int failed = _operationBatch.Count(o => o.Status is OperationStatus.Failed);
+            if (failed > 0)
+            {
+                int succeeded = _operationBatch.Count(o => o.Status is OperationStatus.Succeeded);
+                return CoreTools.Translate("{0} of {1} succeeded, {2} failed", succeeded, total, failed);
+            }
+            int completed = _operationBatch.Count(o =>
+                o.Status is OperationStatus.Succeeded or OperationStatus.Canceled);
+            return CoreTools.Translate("{0} of {1} operations completed", completed, total);
+        }
+    }
+
+    private void AddToBatch(AbstractOperation op)
+    {
+        if (_operationBatch.Count > 0
+            && _operationBatch.All(o => o.Status is not (OperationStatus.InQueue or OperationStatus.Running)))
+        {
+            _operationBatch.Clear();
+            _batchSummaryShown = false;
+        }
+
+        if (!_operationBatch.Contains(op))
+        {
+            _operationBatch.Add(op);
+            ShutdownController.OnOperationJoined();
+        }
+
+        WatchOperations();
+    }
+
+    private readonly HashSet<AbstractOperation> _watchedOperations = [];
+
+    private void WatchOperations()
+    {
+        var wanted = Operations.Select(vm => vm.Operation).Concat(_operationBatch).ToHashSet();
+        foreach (var op in _watchedOperations.Where(op => !wanted.Contains(op)).ToList())
+        {
+            op.StatusChanged -= OnOperationStatusChanged;
+            _watchedOperations.Remove(op);
+        }
+
+        foreach (var op in wanted.Where(_watchedOperations.Add))
+            op.StatusChanged += OnOperationStatusChanged;
+    }
+
+    private void OnOperationStatusChanged(object? sender, OperationStatus e)
+        => Dispatcher.UIThread.Post(() =>
+        {
+            if (sender is AbstractOperation op
+                && e is OperationStatus.InQueue or OperationStatus.Running
+                && !_operationBatch.Contains(op))
+                AddToBatch(op);
+
+            OnPropertyChanged(nameof(OperationsHeaderText));
+            OnPropertyChanged(nameof(HasFailedOperations));
+            OnPropertyChanged(nameof(ShowFailedOperationBadge));
+            MaybeShowBatchSummaryToast();
+            ShutdownController.OnOperationsChanged();
+        });
+
+    private ShutdownWhenFinishedController? _shutdownController;
+
+    public ShutdownWhenFinishedController ShutdownController => _shutdownController ??= CreateShutdownController();
+
+    private ShutdownWhenFinishedController CreateShutdownController() => new(
+        SystemRestartService.CanShutDown,
+        ShutdownBatchStates,
+        () => PendingRebootStore.HasPending,
+        RunShutdownCountdownAsync,
+        ShowShutdownCanceledByFailureToast);
+
+    private List<BatchOperationState> ShutdownBatchStates() =>
+        _operationBatch
+            .Concat(Operations
+                .Select(vm => vm.Operation)
+                .Where(op => op.Status is OperationStatus.InQueue or OperationStatus.Running))
+            .Distinct()
+            .Select(op => new BatchOperationState(op.Status, op.SystemRestartRequired))
+            .ToList();
+
+    private void ShowShutdownCanceledByFailureToast()
+    {
+        var toast = new InfoBarViewModel
+        {
+            Title = CoreTools.Translate("Your computer was not shut down"),
+            Message = CoreTools.Translate(
+                "Some operations failed, so Upkeep did not shut down your computer. Review the failed operations, then shut it down manually."),
+            Severity = InfoBarSeverity.Warning,
+            IsClosable = true,
+            IsOpen = true,
+        };
+        toast.OnClosed = () => DismissToast(toast);
+        ShowToast(toast);
+    }
+
+    private static async Task<ShutdownCountdownOutcome> RunShutdownCountdownAsync(
+        bool restart,
+        Func<bool> operationsActive,
+        CancellationToken newWorkStarted)
+    {
+        if (MainWindow.Instance is not { } owner) return ShutdownCountdownOutcome.Canceled;
+
+        owner.ShowFromTray();
+        return await SystemRestartService.CountdownAndShutDownAsync(owner, restart, operationsActive, newWorkStarted);
+    }
+
+    // Opt-in: one toast summarizing the batch once every operation in it has finished.
+    private void MaybeShowBatchSummaryToast()
+    {
+        if (_batchSummaryShown || _operationBatch.Count == 0) return;
+        if (!Settings.Get(Settings.K.ShowOperationSummaryNotifications)) return;
+        if (_operationBatch.Any(o => o.Status is OperationStatus.InQueue or OperationStatus.Running)) return;
+
+        _batchSummaryShown = true;
+
+        int total = _operationBatch.Count;
+        int failed = _operationBatch.Count(o => o.Status is OperationStatus.Failed);
+        int succeeded = _operationBatch.Count(o => o.Status is OperationStatus.Succeeded);
+
+        var toast = new InfoBarViewModel
+        {
+            Title = failed > 0
+                ? CoreTools.Translate("Operations finished with errors")
+                : CoreTools.Translate("Operations completed"),
+            Message = failed > 0
+                ? CoreTools.Translate("{0} of {1} succeeded, {2} failed", succeeded, total, failed)
+                : CoreTools.Translate("{0} of {1} operations completed", succeeded, total),
+            Severity = failed > 0 ? InfoBarSeverity.Error : InfoBarSeverity.Success,
+            IsClosable = true,
+            IsOpen = true,
+        };
+        toast.OnClosed = () => DismissToast(toast);
+        ShowToast(toast);
+    }
+
+    [RelayCommand]
+    private void ToggleOperationsPanel() => OperationsPanelExpanded = !OperationsPanelExpanded;
+
+    [RelayCommand]
+    private void RetryFailedOperations() => AvaloniaOperationRegistry.RetryFailed();
+
+    [RelayCommand]
+    private void ClearSuccessfulOperations() => AvaloniaOperationRegistry.ClearSuccessful();
+
+    [RelayCommand]
+    private void ClearFinishedOperations() => AvaloniaOperationRegistry.ClearFinished();
+
+    [RelayCommand]
+    private void CancelAllOperations()
+    {
+        ShutdownController.SetArmed(false);
+        AvaloniaOperationRegistry.CancelAll();
+    }
+
+    // ─── Sidebar ─────────────────────────────────────────────────────────────
+    public SidebarViewModel Sidebar { get; } = new();
+
+    // ─── Global search ───────────────────────────────────────────────────────
+    [ObservableProperty]
+    private string _globalSearchText = "";
+
+    [ObservableProperty]
+    private bool _globalSearchEnabled;
+
+    [ObservableProperty]
+    private string _globalSearchPlaceholder = "";
+
+    // When search text changes, notify the current page
+    private PackagesPageViewModel? _subscribedPageViewModel;
+    private bool _syncingSearch;
+
+    partial void OnGlobalSearchTextChanged(string value)
+    {
+        if (_syncingSearch) return;
+        if (CurrentPageContent is AbstractPackagesPage page)
+            page.ViewModel.GlobalQueryText = value;
+        else if (CurrentPageContent is SoftwareCatalogPage catalogPage)
+            catalogPage.ApplyQuery(value);
+        else if (CurrentPageContent is SettingsBasePage)
+            UpdateSettingsSuggestions(value);
+        else if (CurrentPageContent is Views.Pages.LogPages.OperationHistoryPage historyPage)
+            historyPage.ApplyQuery(value);
+        else if (CurrentPageContent is ManagerHealthPage healthPage)
+            healthPage.ApplyQuery(value);
+    }
+
+    public void ClearAllSearchQueries()
+    {
+        DiscoverPage.ViewModel.ClearSearchQuery();
+        UpdatesPage.ViewModel.ClearSearchQuery();
+        InstalledPage.ViewModel.ClearSearchQuery();
+        CatalogPage?.ApplyQuery("");
+        GlobalSearchText = "";
+    }
+
+    // ─── Settings search suggestions ───────────────────────────────────────────
+    public ObservableCollection<SettingsSearchResult> SettingsSuggestions { get; } = new();
+
+    [ObservableProperty]
+    private bool _isSuggestionsOpen;
+
+    [ObservableProperty]
+    private int _selectedSuggestionIndex = -1;
+
+    private void UpdateSettingsSuggestions(string query)
+    {
+        SettingsSuggestions.Clear();
+        foreach (var r in SettingsSearchIndex.Search(query))
+            SettingsSuggestions.Add(r);
+
+        SelectedSuggestionIndex = SettingsSuggestions.Count > 0 ? 0 : -1;
+        IsSuggestionsOpen = SettingsSuggestions.Count > 0;
+    }
+
+    public void MoveSuggestionSelection(int delta)
+    {
+        if (SettingsSuggestions.Count == 0) return;
+        int next = SelectedSuggestionIndex + delta;
+        SelectedSuggestionIndex = Math.Clamp(next, 0, SettingsSuggestions.Count - 1);
+    }
+
+    public void CloseSuggestions()
+    {
+        IsSuggestionsOpen = false;
+        SelectedSuggestionIndex = -1;
+        SettingsSuggestions.Clear();
+    }
+
+    [RelayCommand]
+    public void SelectSuggestion(SettingsSearchResult? result)
+    {
+        if (result is null) return;
+
+        _syncingSearch = true;
+        GlobalSearchText = "";
+        _syncingSearch = false;
+        CloseSuggestions();
+
+        if (result.Manager is not null)
+            OpenManagerSettings(result.Manager);
+        else if (result.PageType is not null)
+            OpenSettingsPage(result.PageType, result.Anchor);
+    }
+
+    private void SubscribeToPageViewModel(AbstractPackagesPage? page)
+    {
+        _subscribedPageViewModel?.PropertyChanged -= OnPageViewModelPropertyChanged;
+
+        _subscribedPageViewModel = page?.ViewModel;
+
+        _subscribedPageViewModel?.PropertyChanged += OnPageViewModelPropertyChanged;
+    }
+
+    private void OnPageViewModelPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(PackagesPageViewModel.GlobalQueryText) && sender is PackagesPageViewModel vm)
+        {
+            _syncingSearch = true;
+            GlobalSearchText = vm.GlobalQueryText;
+            _syncingSearch = false;
+        }
+    }
+
+    // ─── Title bar ───────────────────────────────────────────────────────────
+    // Mirrors WinUI behavior: the version appears next to "Upkeep" only when
+    // the ShowVersionNumberOnTitlebar setting is enabled (the setting is gated
+    // on restart, so a one-shot read at construction is sufficient).
+    public string TitleBarText { get; } = Settings.Get(Settings.K.ShowVersionNumberOnTitlebar)
+        ? $"Upkeep {CoreTools.Translate("version {0}", CoreData.VersionName)}"
+        : "Upkeep";
+
+    // ─── Notifications (bottom-right toasts) ───────────────────────────────────
+    // Persistent banners kept as singletons; RegisterBannerToast mirrors their IsOpen into Toasts.
+    public InfoBarViewModel WinGetWarningBanner { get; } = new() { Severity = InfoBarSeverity.Warning };
+    public InfoBarViewModel TelemetryWarner { get; } = new() { Severity = InfoBarSeverity.Informational };
+    public InfoBarViewModel PortableImportBanner { get; } = new() { Severity = InfoBarSeverity.Informational };
+    public InfoBarViewModel ManagerHealthBanner { get; } = new() { Severity = InfoBarSeverity.Warning };
+    private string _managerHealthBannerKey = "";
+
+    // Oldest first (rendered bottom-up so the newest sits nearest the corner).
+    public ObservableCollection<InfoBarViewModel> Toasts { get; } = new();
+    private readonly Dictionary<InfoBarViewModel, DispatcherTimer> _toastTimers = new();
+    private const int MaxVisibleToasts = 5;
+
+    // A toast with an action button stays until acted on; everything else auto-dismisses.
+    private static bool IsSticky(InfoBarViewModel t) => !string.IsNullOrEmpty(t.ActionButtonText);
+    private static TimeSpan ToastDuration(InfoBarViewModel t)
+        => t.Severity is InfoBarSeverity.Error or InfoBarSeverity.Warning
+            ? TimeSpan.FromSeconds(8)
+            : TimeSpan.FromSeconds(5);
+
+    public void ShowToast(InfoBarViewModel toast)
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(() => ShowToast(toast));
+            return;
+        }
+        if (!Toasts.Contains(toast))
+        {
+            Toasts.Add(toast);
+            AnnounceToast(toast);
+        }
+        TrimToastStack(keep: toast);
+        ArmToastTimer(toast);
+    }
+
+    // Keep the stack from overflowing the screen: drop the oldest auto-dismissing toasts,
+    // but never a sticky (action-button) one or the toast just shown.
+    private void TrimToastStack(InfoBarViewModel keep)
+    {
+        while (Toasts.Count > MaxVisibleToasts)
+        {
+            var oldest = Toasts.FirstOrDefault(t => t != keep && !IsSticky(t));
+            if (oldest is null) break;
+            DismissToast(oldest);
+        }
+    }
+
+    // Surface the toast to screen readers via the live region (assertive for errors so it
+    // interrupts, polite otherwise) — the toast's own automation name isn't announced on its own.
+    private static void AnnounceToast(InfoBarViewModel toast)
+    {
+        string message = string.IsNullOrEmpty(toast.Message)
+            ? toast.Title
+            : $"{toast.Title}. {toast.Message}";
+        AccessibilityAnnouncementService.Announce(
+            message,
+            toast.Severity is InfoBarSeverity.Error
+                ? AutomationLiveSetting.Assertive
+                : AutomationLiveSetting.Polite);
+    }
+
+    public void DismissToast(InfoBarViewModel toast)
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(() => DismissToast(toast));
+            return;
+        }
+        DisposeToastTimer(toast);
+        Toasts.Remove(toast);
+    }
+
+    // Pause the auto-dismiss countdown while the pointer hovers a toast; restart it on leave.
+    public void PauseToast(InfoBarViewModel toast)
+    {
+        if (_toastTimers.TryGetValue(toast, out var timer)) timer.Stop();
+    }
+
+    public void ResumeToast(InfoBarViewModel toast)
+    {
+        if (_toastTimers.TryGetValue(toast, out var timer)) { timer.Stop(); timer.Start(); }
+    }
+
+    private void ArmToastTimer(InfoBarViewModel toast)
+    {
+        DisposeToastTimer(toast);
+        if (IsSticky(toast))
+            return;
+
+        var timer = new DispatcherTimer { Interval = ToastDuration(toast) };
+        timer.Tick += (_, _) => toast.IsOpen = false;
+        _toastTimers[toast] = timer;
+        timer.Start();
+    }
+
+    private void DisposeToastTimer(InfoBarViewModel toast)
+    {
+        if (_toastTimers.Remove(toast, out var timer))
+            timer.Stop();
+    }
+
+    // Mirrors a persistent banner's IsOpen into Toasts so code that just flips IsOpen keeps working.
+    private void RegisterBannerToast(InfoBarViewModel banner)
+    {
+        banner.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(InfoBarViewModel.IsOpen))
+            {
+                if (banner.IsOpen) ShowToast(banner);
+                else DismissToast(banner);
+            }
+            // Content can change in place while the banner stays open (the updater cycles
+            // statuses on the same banner, finally adding the "Update now" action); re-arm so
+            // stickiness/countdown track the new content instead of a stale timer dismissing it.
+            else if (banner.IsOpen && Toasts.Contains(banner))
+            {
+                ArmToastTimer(banner);
+            }
+        };
+    }
+
+    // ─── Constructor ─────────────────────────────────────────────────────────
+    [RelayCommand]
+    private void ToggleSidebar() => Sidebar.IsPaneOpen = !Sidebar.IsPaneOpen;
+
+    public MainWindowViewModel()
+    {
+        AccessibilityAnnouncementService.AnnouncementRequested += OnAnnouncementRequested;
+
+        // Wire before the blocks below flip the banners' IsOpen flags.
+        RegisterBannerToast(WinGetWarningBanner);
+        RegisterBannerToast(TelemetryWarner);
+        RegisterBannerToast(PortableImportBanner);
+        RegisterBannerToast(ManagerHealthBanner);
+
+        CatalogEditor = Sidebar.CatalogEditorEnabled ? new CatalogEditorViewModel() : null;
+        DiscoverPage = new DiscoverSoftwarePage(CatalogEditor);
+        UpdatesPage = new SoftwareUpdatesPage();
+        InstalledPage = new InstalledPackagesPage();
+        BundlesPage = new PackageBundlesPage();
+
+        // Wire loader status → sidebar badges (loaders are null until package engine initializes)
+        foreach (var (pageType, loader) in new (PageType, AbstractPackageLoader?)[]
+        {
+            (PageType.Discover,  DiscoverablePackagesLoader.Instance),
+            (PageType.Updates,   UpgradablePackagesLoader.Instance),
+            (PageType.Installed, InstalledPackagesLoader.Instance),
+        })
+        {
+            if (loader is null) continue;
+            var pt = pageType;
+            loader.FinishedLoading += (_, _) =>
+            {
+                Dispatcher.UIThread.Post(() =>
+                {
+                    Sidebar.SetNavItemLoading(pt, false);
+                    RefreshManagerHealthBanner();
+                });
+                // Return the load's memory to the OS once it settles.
+                Infrastructure.MemoryTrimmer.RequestTrimAfterIdle();
+            };
+            loader.StartedLoading += (_, _) =>
+            {
+                Dispatcher.UIThread.Post(() => Sidebar.SetNavItemLoading(pt, true));
+                Infrastructure.MemoryTrimmer.CancelPending();
+            };
+            Sidebar.SetNavItemLoading(pt, loader.IsLoading);
+        }
+
+        if (UpgradablePackagesLoader.Instance is { } upgLoader)
+        {
+            upgLoader.FinishedLoading += (_, _) => Dispatcher.UIThread.Post(() =>
+            {
+                foreach (var session in _extensions.Values) _ = session.CheckForUpdatesAsync();
+            });
+            upgLoader.PackagesChanged += (_, _) =>
+                Dispatcher.UIThread.Post(() =>
+                {
+                    Sidebar.UpdatesBadgeCount = upgLoader.Count();
+                    MainWindow.Instance?.UpdateSystemTrayStatus();
+                });
+            Sidebar.UpdatesBadgeCount = upgLoader.Count();
+            // Notifications and auto-update logic are handled by SoftwareUpdatesPage.WhenPackagesLoaded
+        }
+
+        foreach (var extension in AppExtensions.All.Where(extension => extension.IsEnabled))
+            SetExtensionEnabled(extension.Page, true);
+
+        MaintenanceScheduler.Start();
+
+        WindowsAppNotificationBridge.NotificationActivated += action =>
+            Dispatcher.UIThread.Post(() => HandleNotificationActivation(action));
+
+        BundlesPage.UnsavedChangesStateChanged += (_, _) =>
+            Dispatcher.UIThread.Post(() =>
+                Sidebar.BundlesBadgeVisible = BundlesPage.HasUnsavedChanges);
+        Sidebar.BundlesBadgeVisible = BundlesPage.HasUnsavedChanges;
+
+        Sidebar.NavigationRequested += (_, pageType) => NavigateTo(pageType);
+
+        // Keep OperationsPanelVisible in sync with the live operations list
+        Operations.CollectionChanged += (_, e) =>
+        {
+            if (e.NewItems is not null)
+                foreach (OperationViewModel vm in e.NewItems)
+                    AddToBatch(vm.Operation);
+            WatchOperations();
+            OperationsPanelVisible = Operations.Count > 0;
+            OnPropertyChanged(nameof(OperationsHeaderText));
+            OnPropertyChanged(nameof(HasFailedOperations));
+            OnPropertyChanged(nameof(ShowFailedOperationBadge));
+            ShutdownController.OnOperationsChanged();
+        };
+
+        if (OperatingSystem.IsWindows() && CoreTools.IsAdministrator() && !Settings.Get(Settings.K.AlreadyWarnedAboutAdmin))
+        {
+            Settings.Set(Settings.K.AlreadyWarnedAboutAdmin, true);
+            WinGetWarningBanner.Title = CoreTools.Translate("Administrator privileges");
+            WinGetWarningBanner.Message = CoreTools.Translate(
+                "Upkeep is running as administrator, which is not recommended. Every operation it launches will have administrator privileges."
+            );
+            WinGetWarningBanner.IsClosable = true;
+            WinGetWarningBanner.IsOpen = true;
+        }
+
+        if (!Settings.Get(Settings.K.ShownTelemetryBanner))
+        {
+            TelemetryWarner.Title = CoreTools.Translate("Share anonymous usage data");
+            TelemetryWarner.Message = CoreTools.Translate(
+                "Upkeep collects anonymous usage data to improve the user experience."
+            );
+            TelemetryWarner.IsClosable = true;
+            TelemetryWarner.ActionButtonText = CoreTools.Translate("Accept");
+            TelemetryWarner.ActionButtonCommand = new CommunityToolkit.Mvvm.Input.RelayCommand(() =>
+            {
+                TelemetryWarner.IsOpen = false;
+                Settings.Set(Settings.K.ShownTelemetryBanner, true);
+            });
+            TelemetryWarner.OnClosed = () => Settings.Set(Settings.K.ShownTelemetryBanner, true);
+            TelemetryWarner.IsOpen = true;
+        }
+
+        if (PortableDataImport.FindImportableSource() is { } importableSource)
+        {
+            ShowPortableImportBanner(importableSource);
+        }
+
+        if (WasUpdatedSinceLastRun() && !Settings.Get(Settings.K.DisableReleaseNotesOnUpdate))
+        {
+            NavigateTo(PageType.ReleaseNotes);
+        }
+        else
+        {
+            LoadDefaultPage();
+        }
+    }
+
+    public void RefreshManagerHealthBanner()
+    {
+        var unhealthy = ManagerHealthEvaluator.ManagersNeedingAttention(PEInterface.Managers);
+        string key = string.Join("|", unhealthy.Select(report => $"{report.Manager.Name}:{report.State}"));
+        if (unhealthy.Count == 0)
+        {
+            _managerHealthBannerKey = "";
+            ManagerHealthBanner.IsOpen = false;
+            return;
+        }
+
+        if (key == _managerHealthBannerKey)
+            return;
+
+        _managerHealthBannerKey = key;
+        ManagerHealthBanner.Title = unhealthy.Count == 1
+            ? CoreTools.Translate("{0} is not working properly", unhealthy[0].Manager.DisplayName)
+            : CoreTools.Translate("{0} package managers are not working properly", unhealthy.Count);
+        ManagerHealthBanner.Message = unhealthy.Count == 1
+            ? ManagerHealthEvaluator.Describe(unhealthy[0])
+            : string.Join(", ", unhealthy.Select(report => report.Manager.DisplayName));
+        ManagerHealthBanner.ActionButtonText = CoreTools.Translate("Open Manager Health");
+        ManagerHealthBanner.ActionButtonCommand = new CommunityToolkit.Mvvm.Input.RelayCommand(() =>
+        {
+            ManagerHealthBanner.IsOpen = false;
+            NavigateTo(PageType.ManagerHealth);
+        });
+        ManagerHealthBanner.IsClosable = true;
+        ManagerHealthBanner.IsOpen = true;
+    }
+
+    private void ShowPortableImportBanner(string importableSource)
+    {
+        void RunImport()
+        {
+            try
+            {
+                int copied = PortableDataImport.Import(importableSource);
+                AppPaths.ClearFirstPortableRun();
+                PortableImportBanner.Severity = InfoBarSeverity.Success;
+                PortableImportBanner.Title = CoreTools.Translate("Settings imported");
+                PortableImportBanner.Message = CoreTools.Translate(
+                    "{0} file(s) were copied. Restart Upkeep to apply them.", copied);
+                PortableImportBanner.ActionButtonText = CoreTools.Translate("Restart");
+                PortableImportBanner.ActionButtonCommand = new CommunityToolkit.Mvvm.Input.RelayCommand(
+                    AppRestartHelper.Restart);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Could not import settings into the portable folder");
+                Logger.Error(ex);
+                PortableImportBanner.OnClosed = null;
+                PortableImportBanner.Severity = InfoBarSeverity.Error;
+                PortableImportBanner.Title = CoreTools.Translate("Could not import settings");
+                PortableImportBanner.Message = ex.Message;
+                PortableImportBanner.ActionButtonText = CoreTools.Translate("Retry");
+                PortableImportBanner.ActionButtonCommand = new CommunityToolkit.Mvvm.Input.RelayCommand(RunImport);
+            }
+        }
+
+        PortableImportBanner.Title = CoreTools.Translate("Import your previous settings?");
+        PortableImportBanner.Message = CoreTools.Translate(
+            "Upkeep is running in portable mode and started with empty settings. Settings from a previous installation were found at {0}.",
+            importableSource
+        );
+        PortableImportBanner.IsClosable = true;
+        PortableImportBanner.ActionButtonText = CoreTools.Translate("Import");
+        PortableImportBanner.ActionButtonCommand = new CommunityToolkit.Mvvm.Input.RelayCommand(RunImport);
+        PortableImportBanner.OnClosed = AppPaths.ClearFirstPortableRun;
+        PortableImportBanner.IsOpen = true;
+    }
+
+    // Returns true the first time the app runs after being updated to a newer build
+    private static bool WasUpdatedSinceLastRun()
+    {
+        _ = int.TryParse(Settings.GetValue(Settings.K.LastKnownBuildNumber), out int lastBuild);
+
+        if (lastBuild != CoreData.BuildNumber)
+        {
+            Settings.SetValue(Settings.K.LastKnownBuildNumber, CoreData.BuildNumber.ToString());
+        }
+
+        return lastBuild != 0 && lastBuild < CoreData.BuildNumber;
+    }
+
+    private void OnAnnouncementRequested(object? _, AccessibilityAnnouncement announcement)
+    {
+        ApplyAnnouncement(
+            announcement,
+            liveSetting => AnnouncementLiveSetting = liveSetting,
+            text => AnnouncementText = text,
+            update => Dispatcher.UIThread.Post(update, DispatcherPriority.Background));
+    }
+
+    // The live region is silenced while it is cleared: on macOS, Avalonia.Native turns an empty
+    // live-region name into a nil NSDictionary value and throws NSInvalidArgumentException,
+    // which crashes the app.
+    internal static void ApplyAnnouncement(
+        AccessibilityAnnouncement announcement,
+        Action<AutomationLiveSetting> setLiveSetting,
+        Action<string> setText,
+        Action<Action> post)
+    {
+        setLiveSetting(AutomationLiveSetting.Off);
+        setText(string.Empty);
+        post(() =>
+        {
+            setLiveSetting(announcement.LiveSetting);
+            setText(announcement.Message);
+        });
+    }
+
+    // ─── Extensions ──────────────────────────────────────────────────────────
+
+    // Lives while the feature is on, so automatic checks and the sidebar badge run with the page closed.
+    internal AppExtensionSession StartGitRepositories()
+    {
+        var gitRepositories = GitRepositories = new GitRepositoriesViewModel();
+        gitRepositories.PropertyChanged += (_, e) =>
+        {
+            // A turned-off instance may still finish a check it had started.
+            if (!ReferenceEquals(gitRepositories, GitRepositories)) return;
+            if (e.PropertyName == nameof(GitRepositoriesViewModel.BehindCount))
+                Sidebar.GitRepositoriesBadgeCount = gitRepositories.BehindCount;
+            else if (e.PropertyName == nameof(GitRepositoriesViewModel.IsBusy))
+                Sidebar.SetNavItemLoading(PageType.GitRepositories, gitRepositories.IsBusy);
+        };
+        _ = gitRepositories.InitializeAsync();
+        return new(() => new GitRepositoriesPage(gitRepositories), () =>
+        {
+            gitRepositories.Stop();
+            GitRepositories = null;
+        });
+    }
+
+    /// <summary>Turns Git Repositories on or off without a restart: its sidebar entry, badge and automatic checks.</summary>
+    public void SetGitRepositoriesEnabled(bool enabled)
+        => SetExtensionEnabled(PageType.GitRepositories, enabled);
+
+    public void SetExtensionEnabled(PageType page, bool enabled)
+    {
+        var extension = AppExtensions.All.FirstOrDefault(extension => extension.Page == page);
+        if (extension is null)
+            return;
+        if (enabled && !extension.IsAvailable())
+        {
+            Logger.Warn($"Cannot enable {extension.Name}: {extension.UnavailableReason()}");
+            enabled = false;
+        }
+        Sidebar.SetExtensionEnabled(page, enabled);
+        if (enabled)
+        {
+            if (!_extensions.ContainsKey(page))
+            {
+                var session = _extensions[page] = extension.Start(this);
+                _ = session.CheckForUpdatesAsync();
+            }
+        }
+        else if (_extensions.Remove(page, out var session))
+        {
+            if (_currentPage == page) LoadDefaultPage();
+            session.Stop();
+        }
+    }
+
+    public void StopExtensions()
+    {
+        foreach (var session in _extensions.Values) session.Stop();
+        _extensions.Clear();
+    }
+
+#if UNIGETUI_XCODE_EXTENSION
+    // Lives while the feature is on, so automatic checks and the sidebar badge run with the page closed.
+    internal AppExtensionSession StartXcode()
+    {
+        var xcode = Xcode = new XcodeViewModel(XcodeViewModel.SharedService, XcodeAccount,
+            XcodeViewModel.SharedCatalog);
+        xcode.PropertyChanged += (_, e) =>
+        {
+            // A turned-off instance may still finish what it had started.
+            if (!ReferenceEquals(xcode, Xcode)) return;
+            if (e.PropertyName == nameof(XcodeViewModel.UpdateCount))
+                Sidebar.XcodeBadgeCount = xcode.UpdateCount;
+            else if (e.PropertyName == nameof(XcodeViewModel.IsBusy))
+                Sidebar.SetNavItemLoading(PageType.Xcode, xcode.IsBusy);
+        };
+        _ = xcode.InitializeAsync();
+        return new(() => new XcodePage(xcode), () =>
+        {
+            xcode.Stop();
+            Xcode = null;
+        });
+    }
+
+    /// <summary>Turns Xcode on or off without a restart: its sidebar entry, badge and automatic checks.</summary>
+    public void SetXcodeEnabled(bool enabled)
+        => SetExtensionEnabled(PageType.Xcode, enabled);
+#endif
+
+    // ─── Navigation ──────────────────────────────────────────────────────────
+    public void LoadDefaultPage()
+    {
+        NavigateTo(PageType.Updates);
+    }
+
+    private void ReleaseWebViewPage(Control? leftPage)
+    {
+        if (leftPage is null) return;
+        if (ReferenceEquals(leftPage, HelpPage)) { HelpPage?.Dispose(); HelpPage = null; }
+        else if (ReferenceEquals(leftPage, ReleaseNotesPage)) { ReleaseNotesPage?.Dispose(); ReleaseNotesPage = null; }
+    }
+
+    private Control GetPageForType(PageType type) =>
+        type switch
+        {
+            PageType.Discover => DiscoverPage,
+            PageType.Updates => UpdatesPage,
+            PageType.Installed => InstalledPage,
+            PageType.Bundles => BundlesPage,
+            PageType.Catalog => CatalogPage ??= new SoftwareCatalogPage(),
+            PageType.CatalogEditor => _catalogEditorPage ??= new CatalogEditorPage(
+                CatalogEditor ?? throw new InvalidOperationException("Catalog Editor is disabled.")),
+            var extensionPage when _extensions.TryGetValue(extensionPage, out var extension) => extension.Page,
+            PageType.Settings => SettingsPage ??= new SettingsBasePage(false),
+            PageType.Managers => ManagersPage ??= new SettingsBasePage(true),
+            PageType.OwnLog => UniGetUILogPage ??= new UniGetUILogPage(),
+            PageType.ManagerLog => ManagerLogPage ??= new ManagerLogsPage(),
+            PageType.OperationHistory => OperationHistoryPage ??= new OperationHistoryPage(),
+            PageType.ManagerHealth => _managerHealthPage ??= new ManagerHealthPage(),
+            PageType.Help => HelpPage ??= new HelpPage(),
+            PageType.ReleaseNotes => ReleaseNotesPage ??= new ReleaseNotesPage(),
+            PageType.Null => throw new InvalidOperationException("Page type is Null"),
+            _ => throw new InvalidDataException($"Unknown page type {type}"),
+        };
+
+    /// <summary>
+    /// The navigation pages in sidebar order: Ctrl/Cmd+1, +2, … follow it (the More menu takes the
+    /// next number), and so does the previous/next page cycle.
+    /// </summary>
+    internal static PageType[] GetShortcutPages(IEnumerable<PageType> navigationPages)
+        => [.. navigationPages];
+
+    public PageType[] ShortcutPages => GetShortcutPages(Sidebar.NavigationPages);
+
+    internal static PageType GetNextPage(PageType type, PageType[] pages) => Step(type, pages, +1);
+
+    internal static PageType GetPreviousPage(PageType type, PageType[] pages) => Step(type, pages, -1);
+
+    // Pages outside the sidebar order (logs, help, …) step to Discover.
+    private static PageType Step(PageType type, PageType[] pages, int direction)
+    {
+        int index = Array.IndexOf(pages, type);
+        return index < 0 ? PageType.Discover : pages[(index + direction + pages.Length) % pages.Length];
+    }
+
+    public void NavigateTo(PageType newPage_t, bool toHistory = true) =>
+        _ = NavigateToAsync(newPage_t, toHistory);
+
+    public async Task<bool> NavigateToAsync(
+        PageType newPage_t,
+        bool toHistory = true,
+        CancellationToken cancellationToken = default)
+    {
+        if (newPage_t is not PageType.Updates and not PageType.Settings and not PageType.OperationHistory)
+        {
+            Logger.Debug($"Upkeep rejected navigation to non-update page: {newPage_t}");
+            return false;
+        }
+
+        if (newPage_t is PageType.Catalog or PageType.CatalogEditor && !Sidebar.SoftwareCatalogEnabled)
+        {
+            Logger.Warn("Software Catalog navigation was rejected because the experimental feature is disabled.");
+            MainWindow.Instance?.ShowBanner(
+                CoreTools.Translate("Software Catalog is disabled"),
+                CoreTools.Translate("Enable Software Catalog in Experimental settings and developer options, then restart Upkeep."),
+                MainWindow.RuntimeNotificationLevel.Error);
+            return false;
+        }
+        if (newPage_t is PageType.CatalogEditor && !Sidebar.CatalogEditorEnabled)
+        {
+            Logger.Warn("Catalog Editor navigation was rejected because the editor is disabled.");
+            MainWindow.Instance?.ShowBanner(
+                CoreTools.Translate("Catalog Editor is disabled"),
+                CoreTools.Translate("Enable the Catalog Editor in Experimental settings and developer options, then restart Upkeep."),
+                MainWindow.RuntimeNotificationLevel.Error);
+            return false;
+        }
+        if (AppExtensions.All.FirstOrDefault(extension => extension.Page == newPage_t) is { IsEnabled: false } disabled)
+        {
+            Logger.Warn($"{disabled.Name} navigation was rejected because it is turned off.");
+            MainWindow.Instance?.ShowBanner(
+                CoreTools.Translate("{0} is turned off", CoreTools.Translate(disabled.Name)),
+                CoreTools.Translate("Turn it on in Settings, under Extensions."),
+                MainWindow.RuntimeNotificationLevel.Error);
+            return false;
+        }
+#if UNIGETUI_XCODE_EXTENSION
+        if (newPage_t is PageType.Xcode && !Sidebar.XcodeEnabled)
+        {
+            Logger.Warn("Xcode navigation was rejected because it is turned off.");
+            MainWindow.Instance?.ShowBanner(
+                CoreTools.Translate("Xcode is turned off"),
+                CoreTools.Translate("Turn it on in Settings, under Extensions."),
+                MainWindow.RuntimeNotificationLevel.Error);
+            return false;
+        }
+#else
+        if (newPage_t is PageType.Xcode)
+            return false;
+#endif
+        if (newPage_t is PageType.About) { _ = ShowAboutDialog(); return true; }
+        if (newPage_t is PageType.Quit) { MainWindow.Instance?.QuitApplication(); return true; }
+
+        if (_currentPage == newPage_t)
+        {
+            // Re-focus the primary control even when we're already on the page
+            (CurrentPageContent as AbstractPackagesPage)?.FocusPackageList();
+            return true;
+        }
+
+        await _navigationSemaphore.WaitAsync(cancellationToken);
+        try
+        {
+            if (_currentPage == newPage_t)
+                return true;
+
+            if (CurrentPageContent is IAsyncLeaveGuard guard
+                && !await guard.CanLeaveAsync(PageLeaveReason.TopLevelNavigation, cancellationToken))
+            {
+                Sidebar.SelectNavButtonForPage(_currentPage);
+                return false;
+            }
+
+            Sidebar.SelectNavButtonForPage(newPage_t);
+
+            var newPage = GetPageForType(newPage_t);
+            var oldPage = CurrentPageContent as Control;
+
+            if (oldPage is ISearchBoxPage oldSPage)
+                oldSPage.QueryBackup = GlobalSearchText;
+            (oldPage as IEnterLeaveListener)?.OnLeave();
+
+            CurrentPageContent = newPage;
+            _oldPage = _currentPage;
+            _currentPage = newPage_t;
+
+            // #5129: Help/ReleaseNotes each host a WebView2 that the control never releases on
+            // detach. Drop the page when leaving so its WebView2 process cluster gets freed.
+            ReleaseWebViewPage(oldPage);
+
+            if (toHistory && _oldPage is not PageType.Null)
+            {
+                NavigationHistory.Add(_oldPage);
+                CanGoBackChanged?.Invoke(this, true);
+            }
+
+            (newPage as AbstractPackagesPage)?.FilterPackages();
+            (newPage as IEnterLeaveListener)?.OnEnter();
+
+            CloseSuggestions();
+
+            if (newPage is ISearchBoxPage newSPage)
+            {
+                SubscribeToPageViewModel(newPage as AbstractPackagesPage);
+                GlobalSearchText = newSPage.QueryBackup;
+                GlobalSearchPlaceholder = newSPage.SearchBoxPlaceholder;
+                GlobalSearchEnabled = true;
+            }
+            else
+            {
+                SubscribeToPageViewModel(null);
+                GlobalSearchText = "";
+                GlobalSearchPlaceholder = "";
+                GlobalSearchEnabled = false;
+            }
+
+            // Focus after search state is restored so MegaQueryVisible is already correct
+            (newPage as AbstractPackagesPage)?.FocusPackageList();
+
+            AccessibilityAnnouncementService.Announce(GetPageAnnouncement(newPage_t));
+            CurrentPageChanged?.Invoke(this, newPage_t);
+            return true;
+        }
+        finally
+        {
+            _navigationSemaphore.Release();
+        }
+    }
+
+    private static string GetPageAnnouncement(PageType pageType) => pageType switch
+    {
+        PageType.Discover => CoreTools.Translate("Discover Packages"),
+        PageType.Updates => CoreTools.Translate("Software Updates"),
+        PageType.Installed => CoreTools.Translate("Installed Packages"),
+        PageType.Bundles => CoreTools.Translate("Package Bundles"),
+        PageType.Catalog => CoreTools.Translate("Software Catalog"),
+        PageType.CatalogEditor => CoreTools.Translate("Catalog Editor"),
+        PageType.GitRepositories => CoreTools.Translate("Git Repositories"),
+        PageType.AgentSkills => CoreTools.Translate("Agent Skills"),
+#if UNIGETUI_XCODE_EXTENSION
+        PageType.Xcode => CoreTools.Translate("Xcode"),
+#endif
+        PageType.Settings => CoreTools.Translate("Settings"),
+        PageType.Managers => CoreTools.Translate("Package Managers"),
+        PageType.OwnLog => CoreTools.Translate("Upkeep Log"),
+        PageType.ManagerLog => CoreTools.Translate("Package Manager logs"),
+        PageType.OperationHistory => CoreTools.Translate("Operation history"),
+        PageType.ManagerHealth => CoreTools.Translate("Manager health"),
+        PageType.Help => CoreTools.Translate("Help"),
+        PageType.ReleaseNotes => CoreTools.Translate("Release notes"),
+        _ => CoreTools.Translate("Upkeep"),
+    };
+
+    /// <summary>Opens the Catalog Editor on a new catalog file, for the Software Catalog's New catalog actions.</summary>
+    public async Task StartNewCatalogAsync()
+    {
+        if (!await NavigateToAsync(PageType.CatalogEditor)) return;
+        if (_catalogEditorPage is { } editor) await editor.StartNewCatalogAsync();
+    }
+
+    public void NavigateBack() => _ = NavigateBackAsync();
+
+    public async Task<bool> NavigateBackAsync(CancellationToken cancellationToken = default)
+    {
+        if (CurrentPageContent is IInnerNavigationPage navPage && navPage.CanGoBack())
+        {
+            return await navPage.GoBackAsync(cancellationToken);
+        }
+        else if (NavigationHistory.Count > 0)
+        {
+            if (!await NavigateToAsync(
+                    NavigationHistory.Last(),
+                    toHistory: false,
+                    cancellationToken))
+                return false;
+
+            NavigationHistory.RemoveAt(NavigationHistory.Count - 1);
+            CanGoBackChanged?.Invoke(this,
+                NavigationHistory.Count > 0
+                || ((CurrentPageContent as IInnerNavigationPage)?.CanGoBack() ?? false));
+            return true;
+        }
+
+        return false;
+    }
+
+    public void OpenManagerLogs(IPackageManager? manager = null)
+        => _ = OpenManagerLogsAsync(manager);
+
+    private async Task OpenManagerLogsAsync(IPackageManager? manager)
+    {
+        if (!await NavigateToAsync(PageType.ManagerLog))
+            return;
+        if (manager is not null)
+            ManagerLogPage?.LoadForManager(manager);
+    }
+
+    public void OpenManagerSettings(IPackageManager? manager = null)
+        => _ = OpenManagerSettingsAsync(manager);
+
+    // Called after a manager is (re)initialized from the settings, so a page that loaded with no manager ready
+    // picks it up without waiting to be shown again.
+    public void ReloadPagesWithoutReadyManager()
+    {
+        UpdatesPage.ViewModel.ReloadIfManagerBecameReady();
+        InstalledPage.ViewModel.ReloadIfManagerBecameReady();
+    }
+
+    public void ReloadPagesAfterManagerExecutableChanged()
+    {
+        _ = UpdatesPage.ViewModel.ReloadAfterManagerExecutableChangedAsync();
+        _ = InstalledPage.ViewModel.ReloadAfterManagerExecutableChangedAsync();
+    }
+
+    private async Task OpenManagerSettingsAsync(IPackageManager? manager)
+    {
+        if (!await NavigateToAsync(PageType.Managers))
+            return;
+        if (manager is not null && ManagersPage is not null)
+            await ManagersPage.NavigateToAsync(manager);
+    }
+
+    public void OpenSettingsPage(Type page, string? anchor = null)
+        => _ = OpenSettingsPageAsync(page, anchor);
+
+    private async Task OpenSettingsPageAsync(Type page, string? anchor)
+    {
+        if (!await NavigateToAsync(PageType.Settings))
+            return;
+        if (SettingsPage is not null)
+            await SettingsPage.NavigateToAsync(page, anchor);
+    }
+
+    public void ShowHelp(string uriAttachment = "")
+        => _ = ShowHelpAsync(uriAttachment);
+
+    private async Task ShowHelpAsync(string uriAttachment)
+    {
+        if (!await NavigateToAsync(PageType.Help))
+            return;
+        HelpPage?.NavigateTo(uriAttachment);
+    }
+
+    public async Task LoadCloudBundleAsync(string content)
+    {
+        await NavigateThenLoadBundleAsync(
+            () => NavigateToAsync(PageType.Bundles),
+            () => BundlesPage.OpenFromString(
+                content,
+                BundleFormatType.UBUNDLE,
+                "GitHub Gist"));
+    }
+
+    public async Task LoadBundleFromFileAsync(string path)
+    {
+        await NavigateThenLoadBundleAsync(
+            () => NavigateToAsync(PageType.Bundles),
+            () => BundlesPage.OpenFromFile(path));
+    }
+
+    internal static async Task<bool> NavigateThenLoadBundleAsync(
+        Func<Task<bool>> navigate,
+        Func<Task> load)
+    {
+        if (!await navigate())
+            return false;
+
+        await load();
+        return true;
+    }
+
+    public bool HasUnsavedWork => !CanShutdownWithoutAsking || BundlesPage.HasChangesToLose;
+
+    /// <summary>
+    /// Whether <see cref="CanShutdownAsync"/> would allow the shutdown without a prompt, for callers
+    /// that need the answer straight away.
+    /// </summary>
+    public bool CanShutdownWithoutAsking
+        => CurrentPageContent is not IAsyncLeaveGuard { HasUnsavedWork: true }
+            && CatalogEditor is not ({ IsBusy: true } or { IsDirty: true })
+#if UNIGETUI_XCODE_EXTENSION
+            && Xcode is not { IsOperationRunning: true }
+#endif
+        ;
+
+    public async Task<bool> CanShutdownAsync(CancellationToken cancellationToken = default)
+    {
+        await _navigationSemaphore.WaitAsync(cancellationToken);
+        try
+        {
+            if (CurrentPageContent is IAsyncLeaveGuard guard
+                && !await guard.CanLeaveAsync(PageLeaveReason.Shutdown, cancellationToken))
+                return false;
+#if UNIGETUI_XCODE_EXTENSION
+            if (Xcode is { IsOperationRunning: true } xcode && !await xcode.ConfirmQuitAsync())
+                return false;
+#endif
+            if (CatalogEditor is null) return true;
+            if (CatalogEditor.IsBusy) return false;
+            if (!CatalogEditor.IsDirty) return true;
+            _catalogEditorPage ??= new CatalogEditorPage(CatalogEditor);
+            return await _catalogEditorPage.ConfirmDiscardAsync();
+        }
+        finally
+        {
+            _navigationSemaphore.Release();
+        }
+    }
+
+    private async Task ShowAboutDialog()
+    {
+        Sidebar.SelectNavButtonForPage(PageType.Null);
+        var owner = (Application.Current?.ApplicationLifetime as IClassicDesktopStyleApplicationLifetime)?.MainWindow;
+        if (owner is not null)
+            await new AboutWindow().ShowDialog(owner);
+        Sidebar.SelectNavButtonForPage(_currentPage);
+    }
+
+    // ─── Notification activation ─────────────────────────────────────────────
+    private async void HandleNotificationActivation(string action)
+    {
+        if (string.Equals(action, NotificationArguments.UpdateAllPackages, StringComparison.OrdinalIgnoreCase))
+        {
+            _ = AvaloniaPackageOperationHelper.UpdateAllAsync();
+        }
+        else if (string.Equals(action, NotificationArguments.ShowOnUpdatesTab, StringComparison.OrdinalIgnoreCase))
+        {
+            if (await NavigateToAsync(PageType.Updates))
+                MainWindow.Instance?.ShowFromTray();
+        }
+        else if (string.Equals(action, NotificationArguments.Show, StringComparison.OrdinalIgnoreCase))
+        {
+            MainWindow.Instance?.ShowFromTray();
+        }
+    }
+
+    // ─── Search box ──────────────────────────────────────────────────────────
+    [RelayCommand]
+    public void SubmitGlobalSearch()
+    {
+        // On settings/managers the box drives the suggestion dropdown: jump to the highlighted
+        // result (falling back to the top one).
+        if (CurrentPageContent is SettingsBasePage)
+        {
+            if (SettingsSuggestions.Count == 0) return;
+            int i = SelectedSuggestionIndex >= 0 ? SelectedSuggestionIndex : 0;
+            SelectSuggestion(SettingsSuggestions[i]);
+            return;
+        }
+
+        if (CurrentPageContent is ISearchBoxPage page)
+            page.SearchBox_QuerySubmitted(this, EventArgs.Empty);
+    }
+}

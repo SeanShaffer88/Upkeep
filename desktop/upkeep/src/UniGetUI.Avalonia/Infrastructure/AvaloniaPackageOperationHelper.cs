@@ -1,0 +1,293 @@
+using System.Diagnostics;
+using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Platform.Storage;
+using CommunityToolkit.Mvvm.Input;
+using UniGetUI.Avalonia.ViewModels;
+using UniGetUI.Avalonia.Views;
+using UniGetUI.Core.Data;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.SettingsEngine;
+using UniGetUI.Core.Tools;
+using UniGetUI.Interface.Enums;
+using UniGetUI.Interface.Telemetry;
+using UniGetUI.PackageEngine;
+using UniGetUI.PackageEngine.Enums;
+using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.ManagerClasses.Classes;
+using UniGetUI.PackageEngine.Operations;
+using UniGetUI.PackageEngine.PackageClasses;
+using UniGetUI.PackageEngine.PackageLoader;
+using UniGetUI.PackageOperations;
+#if WINDOWS
+using UniGetUI.PackageEngine.Managers.WingetManager;
+#endif
+
+namespace UniGetUI.Avalonia.Infrastructure;
+
+/// <summary>
+/// Avalonia-side helpers for bulk package update operations, consumed by
+/// the BackgroundApi event handlers and the --updateapps CLI flag.
+/// </summary>
+internal static class AvaloniaPackageOperationHelper
+{
+    public static Task<IReadOnlyList<AbstractOperation>> UpdateAllAsync(bool background = false)
+        => UpdatePackagesAsync(UpgradablePackagesLoader.Instance.Packages.ToList(), background);
+
+    public static Task<IReadOnlyList<AbstractOperation>> UpdateAllForManagerAsync(string managerName)
+        => UpdatePackagesAsync(UpgradablePackagesLoader.Instance.Packages
+            .Where(p => p.Manager.Id.Equals(managerName, StringComparison.OrdinalIgnoreCase))
+            .ToList());
+
+    private static async Task<IReadOnlyList<AbstractOperation>> UpdatePackagesAsync(
+        IReadOnlyList<IPackage> packages, bool background = false)
+    {
+        List<AbstractOperation> started = [];
+        foreach (var listed in packages)
+        {
+            var pkg = await UpgradablePackagesLoader.Instance.ResolveSkippedMajorUpdateAsync(listed);
+            if (pkg is null) continue;
+            var opts = await InstallOptionsFactory.LoadApplicableAsync(pkg);
+            if (PackageOperation.HasPendingOperation(pkg, OperationType.Update)) continue;
+            if (PackageOperation.IsLeftOutOfBulkUpdates(pkg, opts)) continue;
+            var op = new UpdatePackageOperation(pkg, opts) { IsBackgroundOperation = background };
+            op.OperationSucceeded += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.SUCCESS);
+            op.OperationFailed += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.FAILED);
+            AvaloniaOperationRegistry.Add(op);
+            _ = op.MainThread();
+            started.Add(op);
+        }
+
+        return started;
+    }
+
+    public static async Task UpdateForIdAsync(string packageId)
+    {
+        var listed = UpgradablePackagesLoader.Instance.Packages.FirstOrDefault(p => p.Id == packageId);
+        if (listed is null)
+        {
+            Logger.Warn($"BackgroundApi: no upgradable package found with id={packageId}");
+            return;
+        }
+
+        var pkg = await UpgradablePackagesLoader.Instance.ResolveSkippedMajorUpdateAsync(listed);
+        if (pkg is null) return;
+
+        var opts = await InstallOptionsFactory.LoadApplicableAsync(pkg);
+        if (PackageOperation.HasPendingOperation(pkg, OperationType.Update)) return;
+        var op = new UpdatePackageOperation(pkg, opts);
+        op.OperationSucceeded += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.SUCCESS);
+        op.OperationFailed += (_, _) => TelemetryHandler.UpdatePackage(pkg, TEL_OP_RESULT.FAILED);
+        AvaloniaOperationRegistry.Add(op);
+        _ = op.MainThread();
+    }
+
+    internal static async Task<IStorageFolder?> GetDefaultDownloadFolderAsync(TopLevel win)
+    {
+        try
+        {
+            if (await Task.Run(InstallerDownloadLocation.ResolveStartDirectory) is not { } directory)
+                return null;
+
+            return await win.StorageProvider.TryGetFolderFromPathAsync(directory);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("Could not resolve the default installer download location:");
+            Logger.Warn(ex);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Prompts the user with a save-file dialog and downloads the installer for
+    /// a single package into the chosen location.
+    /// </summary>
+    public static async Task AskLocationAndDownloadAsync(IPackage? package, TEL_InstallReferral referral)
+    {
+        if (package is null) return;
+        if (MainWindow.Instance is not { } win) return;
+
+#if WINDOWS
+        if (package.Manager is WinGet && Settings.Get(Settings.K.WinGetDownloadFullManifest))
+        {
+            await AskFolderAndDownloadWinGetManifestAsync(package, referral, win);
+            return;
+        }
+#endif
+
+        await package.Details.Load();
+
+        if (package.Details.InstallerUrl is null)
+        {
+            Logger.Warn($"No installer URL found for {package.Id}");
+            win.ShowBanner(
+                CoreTools.Translate("No installer is available for {0}", package.Name),
+                CoreTools.Translate(
+                    "{0} did not report a download address for this package. It may not be "
+                        + "offered for your system, or it may no longer exist on {1}.",
+                    package.Manager.DisplayName,
+                    package.Source.AsString_DisplayName
+                ),
+                MainWindow.RuntimeNotificationLevel.Error
+            );
+            return;
+        }
+
+        string? suggestedName = await package.GetInstallerFileName();
+        if (string.IsNullOrWhiteSpace(suggestedName))
+            suggestedName = CoreTools.MakeValidFileName(package.Id) + ".exe";
+
+        string ext = InstallerFileNaming.ExtractExtension(suggestedName) is { Length: > 1 } extension
+            ? CoreTools.MakeValidFileName(extension[1..])
+            : "exe";
+
+        var file = await win.StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        {
+            SuggestedFileName = suggestedName,
+            SuggestedStartLocation = await GetDefaultDownloadFolderAsync(win),
+            FileTypeChoices =
+            [
+                new FilePickerFileType(CoreTools.Translate("Installer")) { Patterns = [$"*.{ext}"] },
+                new FilePickerFileType(CoreTools.Translate("Executable")) { Patterns = ["*.exe"] },
+                new FilePickerFileType(CoreTools.Translate("MSI")) { Patterns = ["*.msi"] },
+                new FilePickerFileType(CoreTools.Translate("Compressed file")) { Patterns = ["*.zip"] },
+                new FilePickerFileType(CoreTools.Translate("MSIX")) { Patterns = ["*.msix"] },
+            ],
+        });
+
+        var path = file?.TryGetLocalPath();
+        if (path is null) return;
+
+        var op = new DownloadOperation(package, path);
+        op.OperationSucceeded += (_, _) => TelemetryHandler.DownloadPackage(package, TEL_OP_RESULT.SUCCESS, referral);
+        op.OperationFailed += (_, _) => TelemetryHandler.DownloadPackage(package, TEL_OP_RESULT.FAILED, referral);
+        AvaloniaOperationRegistry.Add(op);
+        _ = op.MainThread();
+    }
+
+    /// <summary>
+    /// Prompts the user with a folder-picker dialog and downloads the installers
+    /// for all eligible packages into the chosen folder.
+    /// </summary>
+    public static async Task DownloadSelectedAsync(IEnumerable<IPackage> packages, TEL_InstallReferral referral)
+    {
+        if (MainWindow.Instance is not { } win) return;
+
+        var selected = packages.ToList();
+        var eligible = selected
+            .Where(p => !p.Source.IsVirtualManager && p.Manager.Capabilities.CanDownloadInstaller)
+            .ToList();
+
+        if (eligible.Count < selected.Count)
+        {
+            win.ShowBanner(
+                CoreTools.Translate("Some packages cannot be downloaded"),
+                CoreTools.Translate(
+                    "{0} of the {1} selected packages were skipped, because their package "
+                        + "manager cannot download installers or could not be found.",
+                    selected.Count - eligible.Count,
+                    selected.Count
+                ),
+                MainWindow.RuntimeNotificationLevel.Error
+            );
+        }
+
+        if (eligible.Count == 0) return;
+
+        var folders = await win.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        {
+            AllowMultiple = false,
+            SuggestedStartLocation = await GetDefaultDownloadFolderAsync(win),
+        });
+
+        var folder = folders.FirstOrDefault();
+        var outputPath = folder?.TryGetLocalPath();
+        if (outputPath is null) return;
+
+        bool fullManifest = Settings.Get(Settings.K.WinGetDownloadFullManifest);
+        foreach (var pkg in eligible)
+        {
+            AbstractOperation op;
+#if WINDOWS
+            if (fullManifest && pkg.Manager is WinGet)
+                op = new WinGetManifestDownloadOperation(pkg, outputPath);
+            else
+                op = new DownloadOperation(pkg, outputPath);
+#else
+            op = new DownloadOperation(pkg, outputPath);
+#endif
+            op.OperationSucceeded += (_, _) => TelemetryHandler.DownloadPackage(pkg, TEL_OP_RESULT.SUCCESS, referral);
+            op.OperationFailed += (_, _) => TelemetryHandler.DownloadPackage(pkg, TEL_OP_RESULT.FAILED, referral);
+            AvaloniaOperationRegistry.Add(op);
+            _ = op.MainThread();
+        }
+    }
+
+#if WINDOWS
+    private static async Task AskFolderAndDownloadWinGetManifestAsync(
+        IPackage package,
+        TEL_InstallReferral referral,
+        MainWindow win)
+    {
+        var folders = await win.StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        {
+            AllowMultiple = false,
+            SuggestedStartLocation = await GetDefaultDownloadFolderAsync(win),
+        });
+        var folder = folders.FirstOrDefault();
+        var outputPath = folder?.TryGetLocalPath();
+        if (outputPath is null) return;
+
+        var op = new WinGetManifestDownloadOperation(package, outputPath);
+        op.OperationSucceeded += (_, _) => TelemetryHandler.DownloadPackage(package, TEL_OP_RESULT.SUCCESS, referral);
+        op.OperationFailed += (_, _) => TelemetryHandler.DownloadPackage(package, TEL_OP_RESULT.FAILED, referral);
+        AvaloniaOperationRegistry.Add(op);
+        _ = op.MainThread();
+    }
+#endif
+
+    /// <summary>
+    /// Runs the WinGet self-repair sequence elevated and shows a result notification.
+    /// Only meaningful on Windows; no-ops on other platforms.
+    /// </summary>
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    public static async Task HandleBrokenWinGetAsync()
+    {
+        var banner = (MainWindow.Instance?.DataContext as MainWindowViewModel)?.ManagerHealthBanner;
+        bool bannerWasOpen = banner?.IsOpen is true;
+        banner?.IsOpen = false;
+
+        try
+        {
+            var winget = PEInterface.Managers
+                .FirstOrDefault(manager => manager.Name.Equals("WinGet", StringComparison.OrdinalIgnoreCase));
+            var repair = winget?.FindAction("repair-winget");
+            if (winget is null || repair is null)
+                throw new InvalidOperationException(CoreTools.Translate("WinGet is not available on this system"));
+            await winget.RunAsync(repair);
+
+            MainWindow.Instance?.ShowBanner(
+                CoreTools.Translate("WinGet was repaired successfully"),
+                CoreTools.Translate("It is recommended to restart UniGetUI after WinGet has been repaired"),
+                MainWindow.RuntimeNotificationLevel.Success);
+
+            _ = InstalledPackagesLoader.Instance.ReloadPackages();
+            _ = UpgradablePackagesLoader.Instance.ReloadPackages();
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("An error occurred while trying to repair WinGet");
+            Logger.Error(ex);
+
+            if (bannerWasOpen && banner is not null)
+                banner.IsOpen = true;
+
+            MainWindow.Instance?.ShowBanner(
+                CoreTools.Translate("WinGet could not be repaired"),
+                CoreTools.Translate("An unexpected issue occurred while attempting to repair WinGet. Please try again later")
+                    + " — " + ex.Message,
+                MainWindow.RuntimeNotificationLevel.Error);
+        }
+    }
+}

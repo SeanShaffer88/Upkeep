@@ -1,0 +1,57 @@
+<UserControl x:Class="UniGetUI.Avalonia.Views.Pages.SettingsPages.Updates"
+             xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:automation="clr-namespace:Avalonia.Automation;assembly=Avalonia.Controls"
+             xmlns:vm="using:UniGetUI.Avalonia.ViewModels.Pages.SettingsPages"
+             xmlns:settings="using:UniGetUI.Avalonia.Views.Controls.Settings"
+             xmlns:t="using:UniGetUI.Avalonia.MarkupExtensions"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="d"
+             x:DataType="vm:UpdatesViewModel">
+
+    <ScrollViewer HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Orientation="Vertical" Spacing="0">
+
+            <settings:SettingsPageButton x:Name="SchedulerCard"
+                                         Margin="0,32,0,0"
+                                         CornerRadius="8"
+                                         Icon="SandClock"
+                                         Text="{t:Translate Scheduled maintenance}"
+                                         UnderText="{t:Translate Text='Choose when updates are checked and installed, and when automatic installs are skipped or UniGetUI quits'}"
+                                         Command="{Binding NavigateToSchedulerCommand}"/>
+
+            <settings:TranslatedTextBlock Text="Update security"
+                                          FontSize="14"
+                                          FontWeight="SemiBold"
+                                          Margin="44,32,4,8"
+                                          automation:AutomationProperties.HeadingLevel="2"/>
+
+            <settings:ComboboxCard x:Name="MinimumUpdateAgeSelector"
+                                   SettingName="MinimumUpdateAge"
+                                   Text="{t:Translate Minimum age for updates}"
+                                   Description="{t:Translate Only show updates that are at least the specified number of days old}"
+                                   CornerRadius="8,8,8,8"/>
+
+            <settings:TextboxCard x:Name="MinimumUpdateAgeCustomInput"
+                                  SettingName="MinimumUpdateAgeCustom"
+                                  Text="{t:Translate Custom minimum age (days)}"
+                                  Placeholder="{t:Translate e.g. 10}"
+                                  IsNumericOnly="True"
+                                  IsVisible="{Binding IsCustomAgeSelected}"
+                                  BorderThickness="1,0,1,1"
+                                  CornerRadius="0,0,8,8"/>
+
+            <settings:CheckboxCard x:Name="InstallerHostWarningCard"
+                                   SettingName="DisableInstallerHostChangeWarning"
+                                   Text="{t:Translate Text='Warn me when the installer URL host changes between the installed version and the new version (WinGet only)'}"
+                                   CornerRadius="8"
+                                   Margin="0,8,0,0"/>
+
+            <ContentControl x:Name="ReleaseDateCompatTableHolder"
+                            Margin="0,8,0,0"/>
+
+        </StackPanel>
+    </ScrollViewer>
+
+</UserControl>

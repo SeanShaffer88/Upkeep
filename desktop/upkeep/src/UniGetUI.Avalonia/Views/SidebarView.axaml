@@ -1,0 +1,334 @@
+<UserControl x:Class="UniGetUI.Avalonia.Views.SidebarView"
+             xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:automation="clr-namespace:Avalonia.Automation;assembly=Avalonia.Controls"
+             xmlns:vm="using:UniGetUI.Avalonia.ViewModels"
+             xmlns:controls="using:UniGetUI.Avalonia.Views.Controls"
+             xmlns:local="using:UniGetUI.Avalonia.Views"
+             xmlns:t="using:UniGetUI.Avalonia.MarkupExtensions"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="d"
+             x:Name="SidebarRoot"
+             x:DataType="vm:SidebarViewModel"
+             MinWidth="64">
+
+    <Grid x:Name="SidebarLayout" RowDefinitions="*,Auto">
+
+        <!-- Main nav items -->
+        <ListBox x:Name="NavListBox"
+                 Grid.Row="0"
+                 SelectionMode="Single"
+                 KeyboardNavigation.TabNavigation="Continue"
+                 SelectionChanged="NavListBox_SelectionChanged"
+                 Background="Transparent"
+                 BorderThickness="0"
+                 automation:AutomationProperties.AccessibilityView="Control"
+                 automation:AutomationProperties.Name="{t:Translate Navigation}"
+                 Padding="8,10,8,0">
+
+            <ListBox.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <StackPanel/>
+                </ItemsPanelTemplate>
+            </ListBox.ItemsPanel>
+
+            <!-- Software Catalog: first when enabled, as the curated starting point -->
+            <ListBoxItem x:Name="CatalogNavBtn" Tag="Catalog" Classes="nav-item" Padding="4,2" CornerRadius="6"
+                         automation:AutomationProperties.Name="{t:Translate Software Catalog}"
+                         ToolTip.Tip="{t:Translate Software Catalog}">
+                <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                    <controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/catalog.svg"
+                                      Width="24" Height="24" VerticalAlignment="Center"/>
+                    <TextBlock Grid.Column="1" Text="{t:Translate Software Catalog}" FontSize="14"
+                               VerticalAlignment="Center"
+                               IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                </Grid>
+            </ListBoxItem>
+
+            <!-- Discover Packages -->
+            <ListBoxItem x:Name="DiscoverNavBtn" Tag="Discover" Classes="nav-item" Padding="4,2" CornerRadius="6"
+                         automation:AutomationProperties.Name="{t:Translate Discover Packages}"
+                         ToolTip.Tip="{t:Translate Discover Packages}">
+                <Panel>
+                    <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                        <controls:SvgIcon Grid.Column="0" Path="avares://UniGetUI/Assets/Symbols/DiscoverPackage.svg" Width="24" Height="24" VerticalAlignment="Center" />
+                        <TextBlock Grid.Column="1" Text="{t:Translate Discover Packages}"
+                                   FontSize="14"
+                                   FontWeight="Normal"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                    </Grid>
+                    <ProgressBar IsIndeterminate="{Binding DiscoverIsLoading}"
+                                 IsVisible="{Binding DiscoverIsLoading}"
+                                 Height="2"
+                                 Width="32"
+                                 MinWidth="0"
+                                 HorizontalAlignment="Left"
+                                 VerticalAlignment="Bottom"
+                                 Margin="4,0,0,2"/>
+                </Panel>
+            </ListBoxItem>
+
+            <!-- Software Updates -->
+            <ListBoxItem x:Name="UpdatesNavBtn" Tag="Updates" Classes="nav-item" Padding="4,2" CornerRadius="6"
+                         automation:AutomationProperties.Name="{t:Translate Software Updates}"
+                         ToolTip.Tip="{t:Translate Software Updates}">
+                <Panel>
+                    <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                        <controls:SvgIcon Grid.Column="0" Path="avares://UniGetUI/Assets/Symbols/update.svg" Width="24" Height="24" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="{t:Translate Software Updates}"
+                                   FontSize="14"
+                                   FontWeight="Normal"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                    </Grid>
+                    <!-- Update count bubble (InfoBadge-style), anchored to the icon's top-right in both rail and flyout -->
+                    <Border Background="{DynamicResource AccentFillColorDefaultBrush}"
+                            CornerRadius="8"
+                            Padding="3,1"
+                            MinWidth="16"
+                            Height="16"
+                            IsVisible="{Binding UpdatesBadgeVisible}"
+                            HorizontalAlignment="Left"
+                            VerticalAlignment="Top"
+                            Margin="26,5,-20,0">
+                        <TextBlock Text="{Binding UpdatesBadgeText}"
+                                   FontSize="9"
+                                   FontWeight="Bold"
+                                   Foreground="{DynamicResource TextOnAccentFillColorPrimaryBrush}"
+                                   TextAlignment="Center"
+                                   VerticalAlignment="Center"/>
+                    </Border>
+                    <ProgressBar IsIndeterminate="{Binding UpdatesIsLoading}"
+                                 IsVisible="{Binding UpdatesIsLoading}"
+                                 Height="2"
+                                 Width="32"
+                                 MinWidth="0"
+                                 HorizontalAlignment="Left"
+                                 VerticalAlignment="Bottom"
+                                 Margin="4,0,0,2"/>
+                </Panel>
+            </ListBoxItem>
+
+            <!-- Installed Packages -->
+            <ListBoxItem x:Name="InstalledNavBtn" Tag="Installed" Classes="nav-item" Padding="4,2" CornerRadius="6"
+                         automation:AutomationProperties.Name="{t:Translate Installed Packages}"
+                         ToolTip.Tip="{t:Translate Installed Packages}">
+                <Panel>
+                    <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                        <controls:SvgIcon Grid.Column="0" Path="avares://UniGetUI/Assets/Symbols/InstalledPackages.svg" Width="24" Height="24" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="{t:Translate Installed Packages}"
+                                   FontSize="14"
+                                   FontWeight="Normal"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                    </Grid>
+                    <ProgressBar IsIndeterminate="{Binding InstalledIsLoading}"
+                                 IsVisible="{Binding InstalledIsLoading}"
+                                 Height="2"
+                                 Width="32"
+                                 MinWidth="0"
+                                 HorizontalAlignment="Left"
+                                 VerticalAlignment="Bottom"
+                                 Margin="4,0,0,2"/>
+                </Panel>
+            </ListBoxItem>
+
+            <!-- Package Bundles -->
+            <ListBoxItem x:Name="BundlesNavBtn" Tag="Bundles" Classes="nav-item" Padding="4,2" CornerRadius="6"
+                         automation:AutomationProperties.Name="{t:Translate Package Bundles}"
+                         ToolTip.Tip="{t:Translate Package Bundles}">
+                <Panel>
+                    <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                        <controls:SvgIcon Grid.Column="0" Path="avares://UniGetUI/Assets/Symbols/PackagesBundle.svg" Width="24" Height="24" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="{t:Translate Package Bundles}"
+                                   FontSize="14"
+                                   FontWeight="Normal"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                    </Grid>
+                    <!-- Unsaved changes dot, anchored to the icon's top-right in both rail and flyout -->
+                    <Border Background="{DynamicResource SystemFillColorCautionBrush}"
+                            CornerRadius="5"
+                            Width="10"
+                            Height="10"
+                            IsVisible="{Binding BundlesBadgeVisible}"
+                            HorizontalAlignment="Left"
+                            VerticalAlignment="Top"
+                            Margin="28,7,0,0"/>
+                </Panel>
+            </ListBoxItem>
+
+            <!-- Git Repositories: an experimental page, last unless moved -->
+            <ListBoxItem x:Name="GitRepositoriesNavBtn" Tag="GitRepositories" Classes="nav-item" Padding="4,2" CornerRadius="6"
+                         automation:AutomationProperties.Name="{t:Translate Git Repositories}"
+                         ToolTip.Tip="{t:Translate Git Repositories}">
+                <Panel>
+                    <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                        <controls:SvgIcon Grid.Column="0" Path="avares://UniGetUI/Assets/Symbols/git_branch.svg" Width="24" Height="24" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="{t:Translate Git Repositories}"
+                                   FontSize="14"
+                                   FontWeight="Normal"
+                                   VerticalAlignment="Center"
+                                   IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                    </Grid>
+                    <!-- Count of clones that can be fast-forwarded, styled like the updates bubble -->
+                    <Border Background="{DynamicResource AccentFillColorDefaultBrush}"
+                            CornerRadius="8"
+                            Padding="3,1"
+                            MinWidth="16"
+                            Height="16"
+                            IsVisible="{Binding GitRepositoriesBadgeVisible}"
+                            HorizontalAlignment="Left"
+                            VerticalAlignment="Top"
+                            Margin="26,5,-20,0">
+                        <TextBlock Text="{Binding GitRepositoriesBadgeText}"
+                                   FontSize="9"
+                                   FontWeight="Bold"
+                                   Foreground="{DynamicResource TextOnAccentFillColorPrimaryBrush}"
+                                   TextAlignment="Center"
+                                   VerticalAlignment="Center"/>
+                    </Border>
+                    <ProgressBar IsIndeterminate="{Binding GitRepositoriesIsLoading}"
+                                 IsVisible="{Binding GitRepositoriesIsLoading}"
+                                 Height="2"
+                                 Width="32"
+                                 MinWidth="0"
+                                 HorizontalAlignment="Left"
+                                 VerticalAlignment="Bottom"
+                                 Margin="4,0,0,2"/>
+                </Panel>
+            </ListBoxItem>
+
+            <ListBoxItem x:Name="AgentSkillsNavBtn" Tag="AgentSkills" Classes="nav-item" Padding="4,2" CornerRadius="6"
+                         automation:AutomationProperties.Name="{t:Translate Agent Skills}"
+                         ToolTip.Tip="{t:Translate Agent Skills}">
+                <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                    <controls:SvgIcon Grid.Column="0" Path="avares://UniGetUI/Assets/Symbols/skills.svg" Width="24" Height="24" VerticalAlignment="Center"/>
+                    <TextBlock Grid.Column="1" Text="{t:Translate Agent Skills}" FontSize="14" VerticalAlignment="Center"
+                               IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                </Grid>
+            </ListBoxItem>
+        </ListBox>
+
+        <!-- Footer items -->
+        <StackPanel Grid.Row="1" Margin="8,0,8,12" Spacing="2" IsVisible="False">
+            <controls:UserAvatarControl HorizontalAlignment="Left" Margin="8,4,0,4"/>
+
+            <!-- Settings & Package Managers are nav targets too, so they live in their own ListBox
+                 (selection coordinated with the main one in code-behind) and share the nav-item look. -->
+            <ListBox x:Name="FooterNavListBox"
+                     SelectionMode="Single"
+                     KeyboardNavigation.TabNavigation="Continue"
+                     SelectionChanged="FooterNavListBox_SelectionChanged"
+                     Background="Transparent"
+                     BorderThickness="0"
+                     Padding="0">
+
+                <!-- Settings -->
+                <ListBoxItem x:Name="SettingsNavBtn" Tag="Settings" Classes="nav-item" Padding="4,2" CornerRadius="6"
+                             Tapped="SettingsNavBtn_Tapped"
+                             automation:AutomationProperties.Name="{t:Translate Settings}"
+                             ToolTip.Tip="{t:Translate Settings}">
+                    <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                        <controls:SvgIcon Grid.Column="0" x:Name="SettingsIcon" Path="avares://UniGetUI/Assets/Symbols/settings.svg" Width="24" Height="24" VerticalAlignment="Center" RenderTransformOrigin="50%,50%"/>
+                        <TextBlock Grid.Column="1" Text="{t:Translate Settings}" FontSize="14" VerticalAlignment="Center"
+                                   IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                    </Grid>
+                </ListBoxItem>
+
+                <!-- Package Managers -->
+                <ListBoxItem x:Name="ManagersNavBtn" Tag="Managers" Classes="nav-item" Padding="4,2" CornerRadius="6"
+                             automation:AutomationProperties.Name="{t:Translate Package Managers}"
+                             ToolTip.Tip="{t:Translate Package Managers}">
+                    <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                        <controls:SvgIcon Grid.Column="0" Path="avares://UniGetUI/Assets/Symbols/package_managers.svg" Width="24" Height="24" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="{t:Translate Package Managers}" FontSize="14" VerticalAlignment="Center"
+                                   IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                    </Grid>
+                </ListBoxItem>
+
+                <!-- More is kept selected while its flyout is open so its navigation pill remains visible. -->
+                <ListBoxItem x:Name="MoreNavBtn" Tag="More" Classes="nav-item" Padding="4,2" CornerRadius="6"
+                             IsVisible="False"
+                             automation:AutomationProperties.Name="{t:Translate More}"
+                             ToolTip.Tip="{t:Translate More}">
+                    <Panel>
+                        <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" Margin="8,8">
+                            <TextBlock Grid.Column="0" Text="···" FontSize="20" Width="24" HorizontalAlignment="Center" VerticalAlignment="Center" TextAlignment="Center"
+                                       automation:AutomationProperties.AccessibilityView="Raw"/>
+                            <TextBlock Grid.Column="1" Text="{t:Translate More}" FontSize="14" VerticalAlignment="Center"
+                                       IsVisible="{Binding $parent[local:SidebarView].ShowLabels}"/>
+                        </Grid>
+                    </Panel>
+                    <FlyoutBase.AttachedFlyout>
+                        <MenuFlyout Placement="RightEdgeAlignedTop">
+                        <MenuItem Header="{t:Translate Upkeep Log}" Command="{Binding RequestNavigationCommand}" CommandParameter="OwnLog">
+                            <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/buggy.svg" Width="16" Height="16"/></MenuItem.Icon>
+                        </MenuItem>
+                        <MenuItem Header="{t:Translate Package Manager logs}" Command="{Binding RequestNavigationCommand}" CommandParameter="ManagerLog">
+                            <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/console.svg" Width="16" Height="16"/></MenuItem.Icon>
+                        </MenuItem>
+                        <MenuItem Header="{t:Translate Operation history}" Command="{Binding RequestNavigationCommand}" CommandParameter="OperationHistory">
+                            <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/history.svg" Width="16" Height="16"/></MenuItem.Icon>
+                        </MenuItem>
+                        <MenuItem Header="{t:Translate Manager health}" Command="{Binding RequestNavigationCommand}" CommandParameter="ManagerHealth">
+                            <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/package_managers.svg" Width="16" Height="16"/></MenuItem.Icon>
+                        </MenuItem>
+                        <Separator/>
+                        <MenuItem Header="{Binding VersionLabel}" IsEnabled="False">
+                            <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/info_round.svg" Width="16" Height="16"/></MenuItem.Icon>
+                        </MenuItem>
+                        <MenuItem Header="{t:Translate Release notes}" Command="{Binding RequestNavigationCommand}" CommandParameter="ReleaseNotes">
+                            <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/megaphone.svg" Width="16" Height="16"/></MenuItem.Icon>
+                        </MenuItem>
+                        <Separator/>
+                        <MenuItem Header="{t:Translate Help}" Command="{Binding RequestNavigationCommand}" CommandParameter="Help">
+                            <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/help.svg" Width="16" Height="16"/></MenuItem.Icon>
+                        </MenuItem>
+                        <MenuItem Header="{t:Translate About}" Command="{Binding RequestNavigationCommand}" CommandParameter="About">
+                            <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/info_round.svg" Width="16" Height="16"/></MenuItem.Icon>
+                        </MenuItem>
+                        <Separator/>
+                        <MenuItem Header="{t:Translate Quit UniGetUI}" Command="{Binding RequestNavigationCommand}" CommandParameter="Quit">
+                            <MenuItem.Icon><controls:SvgIcon Path="avares://UniGetUI/Assets/Symbols/close_round.svg" Width="16" Height="16"/></MenuItem.Icon>
+                        </MenuItem>
+                        </MenuFlyout>
+                    </FlyoutBase.AttachedFlyout>
+                </ListBoxItem>
+
+            </ListBox>
+
+        </StackPanel>
+
+        <!-- One shared indicator moves between items so selection changes use WinUI's
+             leading/trailing-edge stretch instead of fading separate item indicators. -->
+        <Canvas Grid.RowSpan="2" IsHitTestVisible="False">
+            <!-- Fixed-radius caps preserve the original pill silhouette while the rectangular
+                 stem stretches between them using render transforms only. -->
+            <Panel x:Name="NavigationSelectionPill"
+                   Width="3" Height="16"
+                   IsVisible="False">
+                <Ellipse x:Name="NavigationPillTopCap"
+                         Width="3" Height="3"
+                         HorizontalAlignment="Left"
+                         VerticalAlignment="Top"
+                         RenderTransformOrigin="0%,0%"
+                         Fill="{DynamicResource AccentFillColorDefaultBrush}"/>
+                <Border x:Name="NavigationPillStem"
+                        Width="3" Height="1"
+                        HorizontalAlignment="Left"
+                        VerticalAlignment="Top"
+                        RenderTransformOrigin="0%,0%"
+                        Background="{DynamicResource AccentFillColorDefaultBrush}"/>
+                <Ellipse x:Name="NavigationPillBottomCap"
+                         Width="3" Height="3"
+                         HorizontalAlignment="Left"
+                         VerticalAlignment="Top"
+                         RenderTransformOrigin="0%,0%"
+                         Fill="{DynamicResource AccentFillColorDefaultBrush}"/>
+            </Panel>
+        </Canvas>
+    </Grid>
+</UserControl>

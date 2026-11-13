@@ -1,0 +1,806 @@
+using System.Text.Json;
+using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Avalonia.Models;
+using UniGetUI.Avalonia.ViewModels;
+using UniGetUI.Avalonia.ViewModels.Pages;
+using UniGetUI.Avalonia.Views;
+using UniGetUI.Core.Data;
+using UniGetUI.Interface;
+using CoreSettings = UniGetUI.Core.SettingsEngine.Settings;
+
+namespace UniGetUI.Tests;
+
+public sealed class SoftwareCatalogTests : IDisposable
+{
+    // The catalog saves its view and sort, so keep that away from the real settings.
+    private readonly string _testRoot = Path.Combine(Path.GetTempPath(), nameof(SoftwareCatalogTests), Guid.NewGuid().ToString("N"));
+
+    public SoftwareCatalogTests()
+    {
+        CoreData.TEST_DataDirectoryOverride = Path.Combine(_testRoot, "Data");
+        Directory.CreateDirectory(CoreData.UniGetUIUserConfigurationDirectory);
+        CoreSettings.ResetSettings();
+    }
+
+    public void Dispose()
+    {
+        CoreSettings.ResetSettings();
+        CoreData.TEST_DataDirectoryOverride = null;
+        Directory.Delete(_testRoot, recursive: true);
+    }
+
+    [Theory]
+    [InlineData("clAuDe")]
+    [InlineData("Anthropic.")]
+    public void CatalogSearchMatchesNameAndIdCaseInsensitively(string query)
+    {
+        var vm = new SoftwareCatalogViewModel { HideUnavailablePackages = false };
+        vm.LoadCatalogs([new CatalogDefinition
+        {
+            Id = "test",
+            Name = "Test",
+            Packages =
+            [
+                new CatalogEntry
+                {
+                    Id = "Anthropic.Claude", Name = "Claude", ManagerName = "missing-test-manager", Source = "private",
+                },
+                new CatalogEntry { Id = "other", Name = "Other", ManagerName = "different-manager", Source = "public" },
+            ],
+        }]);
+        var original = vm.Packages[0];
+        vm.Query = $"  {query}  ";
+        Assert.Same(original, Assert.Single(vm.Packages));
+        Assert.False(vm.HasHiddenPackages);
+        vm.HideUnavailablePackages = true;
+        Assert.Empty(vm.Packages);
+        Assert.True(vm.HasHiddenPackages);
+        vm.HideUnavailablePackages = false;
+        Assert.Same(original, Assert.Single(vm.Packages));
+        vm.Query = "no match";
+        Assert.Empty(vm.Packages);
+        Assert.True(vm.IsEmpty);
+        Assert.False(vm.HasHiddenPackages);
+        vm.Query = "";
+        Assert.Equal(2, vm.Packages.Count);
+        Assert.Same(original, vm.Packages[0]);
+    }
+
+    [Fact]
+    public void CatalogDefaultsToIconsAndViewSwitchingPreservesPackagesAndFilters()
+    {
+        var vm = new SoftwareCatalogViewModel
+        {
+            HideUnavailablePackages = false,
+            Query = "Claude",
+        };
+        vm.LoadCatalogs([new CatalogDefinition { Id = "test", Name = "Test", Packages = [Entry] }]);
+        Assert.Equal(2, vm.ViewModeIndex);
+        Assert.False(vm.IsFilterPaneOpen);
+        Assert.True(vm.IsIconsView);
+        var tile = Assert.Single(vm.Packages);
+        for (int index = 0; index < 4; index++)
+        {
+            vm.ViewModeIndex = index;
+            Assert.Equal(index == 0, vm.IsListView);
+            Assert.Equal(index == 1, vm.IsGridView);
+            Assert.Equal(index == 2, vm.IsIconsView);
+            Assert.Equal(index == 3, vm.IsTilesView);
+            Assert.Same(tile, Assert.Single(vm.Packages));
+            Assert.Equal("Claude", vm.Query);
+            Assert.False(vm.HideUnavailablePackages);
+        }
+    }
+
+    [Fact]
+    public void PinnedVersionIsShownOnTheTileAndUnpinnedEntriesShowNone()
+    {
+        var pinned = new CatalogTileViewModel(new CatalogEntry
+        {
+            Id = "is-number",
+            Name = "Is Number",
+            Version = "6.0.0",
+            Source = "npm",
+            ManagerName = "Npm",
+        });
+        Assert.True(pinned.HasPinnedVersion);
+        Assert.Equal("Version 6.0.0", pinned.PinnedVersionText);
+        Assert.Contains("Version 6.0.0", pinned.ToolTipText);
+
+        var latest = new CatalogTileViewModel(new CatalogEntry
+        {
+            Id = "is-number",
+            Name = "Is Number",
+            Source = "npm",
+            ManagerName = "Npm",
+        });
+        Assert.False(latest.HasPinnedVersion);
+        Assert.Equal("", latest.PinnedVersionText);
+        Assert.DoesNotContain("Version", latest.ToolTipText);
+    }
+
+    [Fact]
+    public void ViewModeAndSortAreRestoredByTheNextCatalog()
+    {
+        var first = new SoftwareCatalogViewModel { ViewModeIndex = 0 };
+        first.ToggleSort(CatalogSortField.Source);
+        first.ToggleSort(CatalogSortField.Source);
+        Assert.False(first.SortAscending);
+
+        var restored = new SoftwareCatalogViewModel();
+        Assert.Equal(0, restored.ViewModeIndex);
+        Assert.Equal(CatalogSortField.Source, restored.SortField);
+        Assert.False(restored.SortAscending);
+
+        restored.ToggleSort(CatalogSortField.Id);
+        var afterHeaderClick = new SoftwareCatalogViewModel();
+        Assert.Equal(CatalogSortField.Id, afterHeaderClick.SortField);
+        Assert.True(afterHeaderClick.SortAscending);
+    }
+
+    private const string EntryJson = """
+        {"Id":"Anthropic.Claude","Name":"Claude","Version":"","Source":"winget","ManagerName":"WinGet"}
+        """;
+
+    private static CatalogEntry Entry => new()
+    {
+        Name = "Claude",
+        Id = "Anthropic.Claude",
+        ManagerName = "WinGet",
+        Source = "winget",
+    };
+
+    [Theory]
+    [InlineData(SearchMode.Name, "claude", 1)]
+    [InlineData(SearchMode.Id, "claude", 1)]
+    [InlineData(SearchMode.Name, "anthropic", 0)]
+    [InlineData(SearchMode.Id, "anthropic", 1)]
+    [InlineData(SearchMode.Both, "anthropic", 1)]
+    [InlineData(SearchMode.Exact, "cla", 0)]
+    [InlineData(SearchMode.Exact, "CLAUDE", 1)]
+    [InlineData(SearchMode.Exact, "ANTHROPIC.CLAUDE", 1)]
+    [InlineData(SearchMode.Exact, " ", 1)]
+    public void CatalogSearchModesApplyImmediately(SearchMode mode, string query, int count)
+    {
+        var vm = new SoftwareCatalogViewModel
+        {
+            HideUnavailablePackages = false,
+            Query = query,
+            SearchMode = mode,
+        };
+        vm.LoadCatalogs([new CatalogDefinition { Id = "test", Name = "Test", Packages = [Entry] }]);
+        Assert.Equal(count, vm.Packages.Count);
+        Assert.Equal(mode == SearchMode.Name, vm.SearchMode_Name);
+        Assert.Equal(mode == SearchMode.Id, vm.SearchMode_Id);
+        Assert.Equal(mode == SearchMode.Both, vm.SearchMode_Both);
+        Assert.Equal(mode == SearchMode.Exact, vm.SearchMode_Exact);
+        vm.Query = "anthropic";
+        vm.SearchMode_Name = true;
+        Assert.Empty(vm.Packages);
+        vm.SearchMode_Id = true;
+        Assert.Single(vm.Packages);
+        vm.SearchMode_Exact = true;
+        Assert.Empty(vm.Packages);
+        vm.SearchMode_Both = true;
+        Assert.Single(vm.Packages);
+    }
+
+    [Fact]
+    public void CatalogSourcesFilterByManagerAndSourceAndPersistAcrossSameCatalogReload()
+    {
+        var catalog = new CatalogDefinition
+        {
+            Id = "test",
+            Name = "Test",
+            Packages =
+            [
+                new CatalogEntry { Id = "one", Name = "One", ManagerName = "missing-one", Source = "private" },
+                new CatalogEntry { Id = "two", Name = "Two", ManagerName = "MISSING-ONE", Source = "public" },
+                new CatalogEntry { Id = "three", Name = "Three", ManagerName = "missing-two", Source = "private" },
+            ],
+        };
+        var vm = new SoftwareCatalogViewModel { HideUnavailablePackages = false };
+        vm.LoadCatalogs([catalog]);
+        Assert.False(vm.IsFilterPaneOpen);
+        Assert.Equal(2, vm.SourceNodes.Count);
+        Assert.Equal(2, vm.SourceNodes[0].Children.Count);
+        var first = vm.Packages[0];
+        vm.SourceNodes[0].Children[0].IsSelected = false;
+        Assert.Equal(["three", "two"], vm.Packages.Select(p => p.Entry.Id));
+        Assert.False(vm.SourceNodes[0].IsSelected);
+        vm.SourceNodes[0].IsSelected = true;
+        Assert.Equal(3, vm.Packages.Count);
+        Assert.Same(first, vm.Packages[0]);
+        vm.SourceNodes[0].IsSelected = false;
+        Assert.Equal("three", Assert.Single(vm.Packages).Entry.Id);
+        vm.LoadCatalogs([]);
+        vm.LoadCatalogs([catalog]);
+        Assert.Equal("three", Assert.Single(vm.Packages).Entry.Id);
+        vm.SelectAllSourcesCommand.Execute(null);
+        Assert.Equal(3, vm.Packages.Count);
+        vm.ClearSourceSelectionCommand.Execute(null);
+        Assert.Empty(vm.Packages);
+        vm.HideUnavailablePackages = true;
+        vm.SelectAllSourcesCommand.Execute(null);
+        Assert.Empty(vm.Packages);
+        vm.HideUnavailablePackages = false;
+        Assert.Equal(3, vm.Packages.Count);
+    }
+
+    [Fact]
+    public void CatalogsFilterAndGroupPackagesByCatalog()
+    {
+        var first = new CatalogDefinition
+        {
+            Id = "first",
+            Name = "First",
+            Packages = [new CatalogEntry { Id = "one", Name = "One", ManagerName = "missing-one", Source = "x" }],
+        };
+        var second = new CatalogDefinition
+        {
+            Id = "second",
+            Name = "Second",
+            Packages =
+            [
+                new CatalogEntry { Id = "two", Name = "Two", ManagerName = "missing-one", Source = "x" },
+                new CatalogEntry { Id = "three", Name = "Three", ManagerName = "missing-one", Source = "x" },
+            ],
+        };
+        var vm = new SoftwareCatalogViewModel { HideUnavailablePackages = false, GroupByCatalog = false };
+        vm.LoadCatalogs([first, second]);
+        Assert.Equal(["first", "second"], vm.CatalogNodes.Select(n => n.Definition.Id));
+        Assert.Equal(3, vm.Packages.Count);
+        Assert.Equal(["First", "Second"], vm.Packages.Select(p => p.CatalogName).Distinct().Order());
+
+        var flat = Assert.Single(vm.Groups);
+        Assert.False(flat.HasHeader);
+        Assert.Equal(3, flat.Packages.Count);
+
+        vm.GroupByCatalog = true;
+        Assert.Equal(["First", "Second"], vm.Groups.Select(g => g.Name));
+        Assert.All(vm.Groups, g => Assert.True(g.HasHeader));
+        Assert.Equal([1, 2], vm.Groups.Select(g => g.Packages.Count));
+
+        vm.CatalogNodes[0].IsSelected = false;
+        Assert.Equal(["three", "two"], vm.Packages.Select(p => p.Entry.Id));
+        Assert.Equal("Second", Assert.Single(vm.Groups).Name);
+
+        vm.ClearCatalogSelectionCommand.Execute(null);
+        Assert.Empty(vm.Packages);
+        Assert.Empty(vm.Groups);
+        vm.SelectAllCatalogsCommand.Execute(null);
+        Assert.Equal(3, vm.Packages.Count);
+
+        vm.CatalogNodes[1].IsSelected = false;
+        vm.LoadCatalogs([first, second]);
+        Assert.Equal("one", Assert.Single(vm.Packages).Entry.Id);
+    }
+
+    [Fact]
+    public void UnavailableSourcesAreHiddenByDefaultAndTheFilterRestoresTheSameTiles()
+    {
+        var vm = new SoftwareCatalogViewModel();
+        vm.LoadCatalogs([new CatalogDefinition
+        {
+            Id = "missing-manager",
+            Name = "Missing manager",
+            Packages = [new CatalogEntry { Id = "tool", Name = "Tool", Source = "private", ManagerName = "missing-test-manager" }],
+        }]);
+        Assert.True(vm.HideUnavailablePackages);
+        Assert.Empty(vm.Packages);
+        Assert.True(vm.HasHiddenPackages);
+        vm.HideUnavailablePackages = false;
+        var tile = Assert.Single(vm.Packages);
+        Assert.NotNull(tile.UnavailableReason);
+        vm.HideUnavailablePackages = true;
+        Assert.Empty(vm.Packages);
+        vm.HideUnavailablePackages = false;
+        Assert.Same(tile, Assert.Single(vm.Packages));
+    }
+
+    [Fact]
+    public void FilterRespondsToSourceAvailabilityWithoutLosingStateOrChangingCatalogs()
+    {
+        var vm = new SoftwareCatalogViewModel { HideUnavailablePackages = false };
+        var catalog = new CatalogDefinition
+        {
+            Id = "test",
+            Name = "Test",
+            Packages = [new CatalogEntry { Id = "tool", Name = "Tool", Source = "private", ManagerName = "missing-test-manager" }],
+        };
+        vm.LoadCatalogs([catalog]);
+        var tile = Assert.Single(vm.Packages);
+        vm.HideUnavailablePackages = true;
+        tile.UpdateState(true, null, true, false);
+        vm.ApplyAvailabilityFilter();
+        Assert.Same(tile, Assert.Single(vm.Packages));
+        Assert.True(tile.IsInstalled);
+        Assert.False(vm.HasHiddenPackages);
+        tile.UpdateState(true, "Disabled source", true, false);
+        vm.ApplyAvailabilityFilter();
+        Assert.Empty(vm.Packages);
+        Assert.Same(catalog, Assert.Single(vm.CatalogNodes).Definition);
+        vm.LoadCatalogs([]);
+        vm.HideUnavailablePackages = false;
+        Assert.Empty(vm.Packages);
+        Assert.False(vm.HasHiddenPackages);
+    }
+
+    [Fact]
+    public void CatalogFileLivesInTheGlobalDirectory()
+    {
+        Assert.Equal(Path.Combine(CoreData.UniGetUIGlobalDirectory, "SoftwareCatalog.json"), SoftwareCatalog.FilePath);
+    }
+
+    private static string CatalogJson(string packages, string id = "tools", string name = "Tools") =>
+        $$"""{"id":"{{id}}","name":"{{name}}","packages":[{{packages}}]}""";
+
+    private static string DocumentJson(string catalogs) =>
+        $$"""{"version":1,"catalogs":[{{catalogs}}]}""";
+
+    [Fact]
+    public void MultipleCatalogsLoadWithSourceGeneratedMetadata()
+    {
+        var catalogs = SoftwareCatalog.Parse(DocumentJson($"{CatalogJson(EntryJson)},{CatalogJson(EntryJson, "development", "Development")}"));
+        Assert.Equal(["tools", "development"], catalogs.Select(c => c.Id).ToArray());
+        Assert.Equal(["Tools", "Development"], catalogs.Select(c => c.Name).ToArray());
+        Assert.All(catalogs, c => Assert.Equal("Anthropic.Claude", Assert.Single(c.Packages).Id));
+    }
+
+    [Fact]
+    public void TheRequestedBundleStyleDocumentLoadsExactly()
+    {
+        const string json = """
+            {
+              "version": 1,
+              "catalogs": [
+                {
+                  "id": "devolutions",
+                  "name": "Devolutions",
+                  "packages": [
+                    {
+                      "Id": "Microsoft.VisualStudioCode",
+                      "Name": "Visual Studio Code",
+                      "Version": "",
+                      "Source": "winget",
+                      "ManagerName": "WinGet"
+                    }
+                  ]
+                }
+              ]
+            }
+            """;
+        var catalog = Assert.Single(SoftwareCatalog.Parse(json));
+        Assert.Equal("devolutions", catalog.Id);
+        Assert.Equal("Devolutions", catalog.Name);
+        var entry = Assert.Single(catalog.Packages);
+        Assert.Equal("Microsoft.VisualStudioCode", entry.Id);
+        Assert.Equal("Visual Studio Code", entry.Name);
+        Assert.Equal("", entry.Version);
+        Assert.Equal("winget", entry.Source);
+        Assert.Equal("WinGet", entry.ManagerName);
+    }
+
+    [Fact]
+    public void MissingPackageVersionDefaultsToEmptyLikeBundles()
+    {
+        string entry = EntryJson.Replace("\"Version\":\"\",", "");
+        Assert.Equal("", Assert.Single(Assert.Single(SoftwareCatalog.Parse(DocumentJson(CatalogJson(entry)))).Packages).Version);
+    }
+
+    [Fact]
+    public void LegacyPackageFieldsInsideANewDocumentAreRejected()
+    {
+        const string entry = """{"name":"Claude","id":"Anthropic.Claude","manager":"winget","source":"winget"}""";
+        Assert.Throws<JsonException>(() => SoftwareCatalog.Parse(DocumentJson(CatalogJson(entry))));
+    }
+
+    [Fact]
+    public void EmptyCatalogsAreValidAndNoDefaultIsInjected()
+    {
+        Assert.Empty(SoftwareCatalog.Parse(DocumentJson("")));
+        Assert.Empty(Assert.Single(SoftwareCatalog.Parse(DocumentJson(CatalogJson("")))).Packages);
+    }
+
+    [Fact]
+    public async Task MissingCatalogIsReportedInsteadOfUsingADefault()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"missing-catalog-{Guid.NewGuid():N}.json");
+        await Assert.ThrowsAsync<FileNotFoundException>(() => SoftwareCatalog.LoadAsync(path));
+        Assert.False(File.Exists(path));
+    }
+
+    [Fact]
+    public async Task CatalogFileReloadReadsUpdatedCatalogDefinitions()
+    {
+        string path = Path.GetTempFileName();
+        try
+        {
+            await File.WriteAllTextAsync(path, DocumentJson(CatalogJson(EntryJson)));
+            Assert.Equal("tools", Assert.Single(await SoftwareCatalog.LoadAsync(path)).Id);
+            await File.WriteAllTextAsync(path, DocumentJson(CatalogJson("", "development", "Development")));
+            var catalog = Assert.Single(await SoftwareCatalog.LoadAsync(path));
+            Assert.Equal("development", catalog.Id);
+            Assert.Equal("Development", catalog.Name);
+            Assert.Empty(catalog.Packages);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void CatalogSelectorTracksEmptyCatalogs()
+    {
+        var vm = new SoftwareCatalogViewModel();
+        var first = new CatalogDefinition { Id = "first", Name = "First", Packages = [] };
+        var second = new CatalogDefinition { Id = "second", Name = "Second", Packages = [] };
+        vm.LoadCatalogs([first, second]);
+        Assert.Equal(2, vm.CatalogNodes.Count);
+        Assert.True(vm.IsEmpty);
+        Assert.Empty(vm.Packages);
+        vm.ErrorMessage = "Catalog file unavailable";
+        Assert.False(vm.IsEmpty);
+        Assert.True(vm.HasError);
+    }
+
+    [Fact]
+    public void ExperimentalCatalogOptionIsSearchable()
+    {
+        Assert.Contains(
+            global::UniGetUI.Avalonia.Infrastructure.SettingsSearchIndex.Search("software catalog"),
+            result => result.Anchor == "SoftwareCatalogCard");
+    }
+
+    [Theory]
+    [InlineData("""{"id":"","name":"Tools","packages":[]}""")]
+    [InlineData("""{"id":"tools","name":" ","packages":[]}""")]
+    [InlineData("""{"id":"tools","name":"Tools"}""")]
+    [InlineData("""{"id":"tools","name":"Tools","packages":null}""")]
+    [InlineData("""{"id":null,"name":"Tools","packages":[]}""")]
+    [InlineData("null")]
+    public void InvalidCatalogDefinitionIsRejected(string catalog) =>
+        Assert.Throws<JsonException>(() => SoftwareCatalog.Parse(DocumentJson(catalog)));
+
+    [Fact]
+    public void CatalogIdsMustBeUniqueRegardlessOfCase()
+    {
+        Assert.Throws<JsonException>(() => SoftwareCatalog.Parse(DocumentJson($"{CatalogJson("")},{CatalogJson("", "TOOLS")}")));
+    }
+
+    [Fact]
+    public void CatalogIdentityIncludesManagerAndSource()
+    {
+        Assert.True(Entry.Matches("anthropic.claude", "WinGet", "WINGET"));
+        Assert.False(Entry.Matches("Anthropic.Claude", "scoop", "winget"));
+        Assert.False(Entry.Matches("Anthropic.Claude", "winget", "msstore"));
+        Assert.False(Entry.Matches("Anthropic.Claude.Other", "winget", "winget"));
+    }
+
+    [Theory]
+    [InlineData("Chocolatey")]
+    [InlineData("chocolatey")]
+    [InlineData("CHOCOLATEY")]
+    public void ChocolateyInstalledMatchingIgnoresFeedButRepositoryMatchingRemainsExact(string managerName)
+    {
+        var manager = new UniGetUI.PackageEngine.Managers.ChocolateyManager.Chocolatey();
+        var entry = new CatalogEntry
+        {
+            Id = "example.tool",
+            Name = "Example tool",
+            ManagerName = managerName,
+            Source = "private",
+        };
+        var installed = new UniGetUI.PackageEngine.PackageClasses.Package(
+            "Example tool", "EXAMPLE.TOOL", "1.0", manager.DefaultSource, manager);
+        Assert.True(entry.MatchesInstalled(installed));
+        Assert.False(entry.Matches(installed));
+        var privateSource = new UniGetUI.PackageEngine.Classes.Manager.ManagerSource(
+            manager, "private", new Uri("https://example.test/feed"));
+        var repositoryPackage = new UniGetUI.PackageEngine.PackageClasses.Package(
+            "Example tool", entry.Id, "2.0", privateSource, manager);
+        Assert.True(entry.Matches(repositoryPackage));
+        Assert.True(entry.MatchesInstalled(repositoryPackage));
+        var differentPackage = new UniGetUI.PackageEngine.PackageClasses.Package(
+            "Different tool", "example.other", "1.0", manager.DefaultSource, manager);
+        Assert.False(entry.MatchesInstalled(differentPackage));
+        var tile = new CatalogTileViewModel(entry);
+        tile.UpdateState(entry.MatchesInstalled(installed), null, true, false);
+        Assert.True(tile.IsInstalled);
+        Assert.False(tile.ShowInstall);
+        Assert.False(tile.CanInstall);
+    }
+
+    [Fact]
+    public void OtherManagersStillRequireTheInstalledSourceAndManagerToMatch()
+    {
+        var manager = new UniGetUI.PackageEngine.Managers.NpmManager.Npm();
+        var entry = new CatalogEntry
+        {
+            Id = "example.tool",
+            Name = "Example tool",
+            ManagerName = manager.Id,
+            Source = "private",
+        };
+        var package = new UniGetUI.PackageEngine.PackageClasses.Package(
+            entry.Name, entry.Id, "1.0", manager.DefaultSource, manager);
+        Assert.False(entry.MatchesInstalled(package));
+        var privateSource = new UniGetUI.PackageEngine.Classes.Manager.ManagerSource(
+            manager, "PRIVATE", new Uri("https://example.test/feed"));
+        package = new UniGetUI.PackageEngine.PackageClasses.Package(
+            entry.Name, entry.Id, "1.0", privateSource, manager);
+        Assert.True(entry.MatchesInstalled(package));
+        var chocolateyEntry = new CatalogEntry
+        {
+            Id = entry.Id,
+            Name = entry.Name,
+            ManagerName = "chocolatey",
+            Source = "private",
+        };
+        Assert.False(chocolateyEntry.MatchesInstalled(package));
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("{}")]
+    [InlineData("""{"catalogs":[]}""")]
+    [InlineData("""{"version":1}""")]
+    [InlineData("""{"version":0,"catalogs":[]}""")]
+    [InlineData("""{"version":2,"catalogs":[]}""")]
+    [InlineData("""{"version":1,"catalogs":null}""")]
+    [InlineData("""{"version":"1","catalogs":[]}""")]
+    [InlineData("[]")]
+    [InlineData("[null]")]
+    [InlineData("[{}]")]
+    [InlineData("""[{"name":"Claude","id":"Anthropic.Claude","manager":"winget"}]""")]
+    [InlineData("""[{"name":"Claude","id":"","manager":"winget","source":"winget"}]""")]
+    [InlineData("""[{"name":" ","id":"Anthropic.Claude","manager":"winget","source":"winget"}]""")]
+    [InlineData("""[{"name":"Claude","id":"Anthropic.Claude","manager":null,"source":"winget"}]""")]
+    public void InvalidCatalogIsRejected(string json) =>
+        Assert.Throws<JsonException>(() => SoftwareCatalog.Parse(json));
+
+    [Theory]
+    [InlineData("""{"Name":"Claude","Id":"Anthropic.Claude","ManagerName":"WinGet"}""")]
+    [InlineData("""{"Name":"Claude","Id":"","ManagerName":"WinGet","Source":"winget"}""")]
+    [InlineData("""{"Name":" ","Id":"Anthropic.Claude","ManagerName":"WinGet","Source":"winget"}""")]
+    [InlineData("""{"Name":"Claude","Id":"Anthropic.Claude","ManagerName":null,"Source":"winget"}""")]
+    [InlineData("""{"Name":"Claude","Id":"Anthropic.Claude","ManagerName":"WinGet","Source":"winget","Version":null}""")]
+    [InlineData("null")]
+    public void InvalidPackageInCatalogIsRejected(string package) =>
+        Assert.Throws<JsonException>(() => SoftwareCatalog.Parse(DocumentJson(CatalogJson(package))));
+
+    [Fact]
+    public void DuplicateIdentitiesAreRejectedRegardlessOfCase()
+    {
+        string duplicate = EntryJson.Replace("WinGet", "WINGET").Replace("winget", "WINGET").Replace("Anthropic.Claude", "anthropic.claude");
+        Assert.Throws<JsonException>(() => SoftwareCatalog.Parse(DocumentJson(CatalogJson($"{EntryJson},{duplicate}"))));
+    }
+
+    [Fact]
+    public void SamePackageIdCanAppearInDifferentSources()
+    {
+        string otherSource = EntryJson.Replace("\"Source\":\"winget\"", "\"Source\":\"private\"");
+        Assert.Equal(2, Assert.Single(SoftwareCatalog.Parse(DocumentJson(CatalogJson($"{EntryJson},{otherSource}")))).Packages.Length);
+    }
+
+    [Fact]
+    public void AvailableUninstalledTileCanInstall()
+    {
+        var tile = new CatalogTileViewModel(Entry);
+        tile.UpdateState(false, null, true, false);
+
+        Assert.True(tile.ShowInstall);
+        Assert.True(tile.CanInstall);
+        Assert.Equal(1, tile.TitleOpacity);
+        Assert.Equal("", tile.StatusText);
+        Assert.Null(tile.IconBitmap);
+        Assert.False(tile.HasCustomIcon);
+    }
+
+    [Fact]
+    public void CatalogIconChangesNotifyTheTile()
+    {
+        global::Avalonia.Skia.SkiaPlatform.Initialize();
+        var tile = new CatalogTileViewModel(Entry);
+        var changed = new List<string?>();
+        tile.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+        using var bitmap = new global::Avalonia.Media.Imaging.WriteableBitmap(
+            new global::Avalonia.PixelSize(1, 1), new global::Avalonia.Vector(96, 96),
+            global::Avalonia.Platform.PixelFormat.Bgra8888, global::Avalonia.Platform.AlphaFormat.Premul);
+
+        tile.IconBitmap = bitmap;
+        Assert.True(tile.HasCustomIcon);
+        Assert.Contains(nameof(tile.IconBitmap), changed);
+        Assert.Contains(nameof(tile.HasCustomIcon), changed);
+        tile.IconBitmap = null;
+        Assert.False(tile.HasCustomIcon);
+    }
+
+    [Fact]
+    public void InstalledTileHidesInstallButton()
+    {
+        var tile = new CatalogTileViewModel(Entry);
+        tile.UpdateState(true, null, true, false);
+
+        Assert.True(tile.IsInstalled);
+        Assert.False(tile.ShowInstall);
+        Assert.False(tile.CanInstall);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void UnavailableSourceDimsTitleAndExplainsWhy(bool installed)
+    {
+        var tile = new CatalogTileViewModel(Entry);
+        tile.UpdateState(installed, "Source winget is disabled.", true, false);
+
+        Assert.Equal(0.45, tile.TitleOpacity);
+        Assert.Equal("Source winget is disabled.", tile.UnavailableReason);
+        Assert.Equal(tile.UnavailableReason, tile.StatusText);
+        Assert.False(tile.CanInstall);
+        Assert.Equal(!installed, tile.ShowInstall);
+    }
+
+    [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(true, true, false)]
+    [InlineData(true, false, true)]
+    public void UnknownInventoryAndPendingInstallsCannotInstall(bool inventoryKnown, bool pending, bool busy)
+    {
+        var tile = new CatalogTileViewModel(Entry);
+        tile.UpdateState(false, null, inventoryKnown, pending);
+        tile.IsBusy = busy;
+
+        Assert.False(tile.CanInstall);
+        Assert.NotEmpty(tile.StatusText);
+    }
+
+    [Fact]
+    public void TileRecoversAfterSourceIsEnabledOrInstallFails()
+    {
+        var tile = new CatalogTileViewModel(Entry);
+        tile.UpdateState(false, "Source disabled.", true, false);
+        tile.UpdateState(false, null, true, true);
+        tile.UpdateState(false, null, true, false);
+
+        Assert.True(tile.CanInstall);
+        Assert.Equal(1, tile.TitleOpacity);
+        Assert.Null(tile.UnavailableReason);
+    }
+
+    [Fact]
+    public void TileTracksInstallAndUninstall()
+    {
+        var tile = new CatalogTileViewModel(Entry);
+        tile.UpdateState(false, null, true, true);
+        Assert.False(tile.CanInstall);
+        tile.UpdateState(true, null, true, false);
+        Assert.False(tile.ShowInstall);
+        tile.UpdateState(false, null, true, false);
+        Assert.True(tile.ShowInstall);
+        Assert.True(tile.CanInstall);
+    }
+
+    [Fact]
+    public void NumberShortcutsFollowTheSidebarOrder()
+    {
+        Assert.Equal(
+            [PageType.Catalog, PageType.Discover, PageType.Updates, PageType.Installed, PageType.Bundles,
+                PageType.Settings, PageType.Managers],
+            MainWindowViewModel.GetShortcutPages(NavigationPageOrder.DefaultPages(true)));
+        Assert.Equal(
+            [PageType.Discover, PageType.Updates, PageType.Installed, PageType.Bundles, PageType.Settings, PageType.Managers],
+            MainWindowViewModel.GetShortcutPages(NavigationPageOrder.DefaultPages(false)));
+        Assert.Equal(
+            [PageType.Updates, PageType.Discover, PageType.Installed, PageType.Bundles, PageType.Settings, PageType.Managers],
+            MainWindowViewModel.GetShortcutPages(NavigationPageOrder.Resolve("Updates,Discover", false)));
+    }
+
+    [Theory]
+    [InlineData(true, "")]
+    [InlineData(false, "")]
+    [InlineData(true, "Bundles,Updates,Catalog")]
+    [InlineData(false, "Bundles,Updates,Catalog")]
+    public void KeyboardPageCycleFollowsTheSidebarOrderInBothDirections(bool catalogEnabled, string stored)
+    {
+        var pages = MainWindowViewModel.GetShortcutPages(NavigationPageOrder.Resolve(stored, catalogEnabled));
+        for (int i = 0; i < pages.Length; i++)
+        {
+            var next = pages[(i + 1) % pages.Length];
+            Assert.Equal(next, MainWindowViewModel.GetNextPage(pages[i], pages));
+            Assert.Equal(pages[i], MainWindowViewModel.GetPreviousPage(next, pages));
+        }
+        Assert.Equal(PageType.Discover, MainWindowViewModel.GetNextPage(PageType.OwnLog, pages));
+    }
+
+    [Theory]
+    [InlineData("", true, new[] { PageType.Catalog, PageType.Discover, PageType.Updates, PageType.Installed, PageType.Bundles })]
+    [InlineData("", false, new[] { PageType.Discover, PageType.Updates, PageType.Installed, PageType.Bundles })]
+    [InlineData("Updates,Installed", true, new[] { PageType.Updates, PageType.Installed, PageType.Catalog, PageType.Discover, PageType.Bundles })]
+    // The Catalog Editor opens from the catalog page, so an order saved with it in the sidebar drops it.
+    [InlineData("CatalogEditor,Bundles,Catalog", true, new[] { PageType.Bundles, PageType.Catalog, PageType.Discover, PageType.Updates, PageType.Installed })]
+    [InlineData("CatalogEditor,Bundles,Catalog,Discover", false, new[] { PageType.Bundles, PageType.Discover, PageType.Updates, PageType.Installed })]
+    [InlineData(" Bundles , Bogus,Settings,Bundles,,OwnLog,Null", false, new[] { PageType.Bundles, PageType.Discover, PageType.Updates, PageType.Installed })]
+    public void StoredNavigationOrderResolvesToEveryVisiblePageOnce(string stored, bool catalogEnabled, PageType[] expected)
+        => Assert.Equal(expected, NavigationPageOrder.Resolve(stored, catalogEnabled));
+
+    [Fact]
+    public void ReorderingWithTheCatalogHiddenKeepsTheCatalogPagesInPlace()
+    {
+        var full = NavigationPageOrder.Resolve("Discover,Catalog,Updates,Installed,Bundles", true);
+        var merged = NavigationPageOrder.Merge(full, [PageType.Bundles, PageType.Discover, PageType.Updates, PageType.Installed]);
+
+        Assert.Equal(
+            [PageType.Bundles, PageType.Catalog, PageType.Discover, PageType.Updates, PageType.Installed],
+            merged);
+        Assert.Equal(
+            [PageType.Bundles, PageType.Discover, PageType.Updates, PageType.Installed],
+            NavigationPageOrder.Resolve(NavigationPageOrder.Serialize(merged), false));
+    }
+
+    [Fact]
+    public void TheDefaultNavigationOrderIsStoredAsUnset()
+    {
+        Assert.Equal("", NavigationPageOrder.Serialize(NavigationPageOrder.DefaultPages(true, true, true)));
+        Assert.Equal(
+            "Discover,Catalog,Updates,Installed,Bundles",
+            NavigationPageOrder.Serialize(NavigationPageOrder.Resolve("Discover", true)));
+    }
+
+    [Fact]
+    public void OnlyACatalogWithPackagesCountsAsUsable()
+    {
+        string file = Path.Combine(_testRoot, "SoftwareCatalog.json");
+        Assert.False(SoftwareCatalog.HasUsableCatalog(file));
+
+        File.WriteAllText(file, "{ not json");
+        Assert.False(SoftwareCatalog.HasUsableCatalog(file));
+
+        File.WriteAllText(file, """{"version":1,"catalogs":[]}""");
+        Assert.False(SoftwareCatalog.HasUsableCatalog(file));
+
+        File.WriteAllText(file, """{"version":1,"catalogs":[{"id":"a","name":"A","packages":[]}]}""");
+        Assert.False(SoftwareCatalog.HasUsableCatalog(file));
+
+        File.WriteAllText(file, """{"version":1,"catalogs":[{"id":"a","name":"A","packages":[{"Id":"jq","Name":"jq","Version":"","Source":"Homebrew","ManagerName":"Homebrew"}]}]}""");
+        Assert.True(SoftwareCatalog.HasUsableCatalog(file));
+
+        // A package feed fills its catalog at run time, but only on macOS and Windows, where feeds are read.
+        File.WriteAllText(file, """{"version":1,"catalogs":[{"id":"a","name":"A","packages":[],"pkgFeed":"https://h/mac/"}]}""");
+        Assert.Equal(OperatingSystem.IsMacOS() || OperatingSystem.IsWindows(), SoftwareCatalog.HasUsableCatalog(file));
+    }
+
+    [Fact]
+    public async Task APkgFeedIsKeptOnSaveAndOmittedWhenAbsent()
+    {
+        var catalogs = SoftwareCatalog.Parse(DocumentJson(
+            """{"id":"mac","name":"Mac apps","packages":[],"pkgFeed":"https://software.example.com/mac/"},"""
+            + CatalogJson(EntryJson)));
+        Assert.Equal("https://software.example.com/mac/", catalogs[0].PkgFeed);
+        Assert.Null(catalogs[1].PkgFeed);
+
+        string file = Path.Combine(_testRoot, "saved.json");
+        await SoftwareCatalog.SaveAsync(file, catalogs);
+        string json = File.ReadAllText(file);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(json, "pkgFeed"));
+        Assert.Equal(catalogs.Select(c => c.PkgFeed), SoftwareCatalog.Parse(json).Select(c => c.PkgFeed));
+    }
+
+    [Fact]
+    public void AnEmptyPkgFeedIsRejected() =>
+        Assert.Throws<JsonException>(() => SoftwareCatalog.Parse(DocumentJson(
+            """{"id":"mac","name":"Mac apps","packages":[],"pkgFeed":" "}""")));
+
+    [Fact]
+    public void CatalogIsAnIpcNavigationTarget()
+    {
+        Assert.Contains("catalog", IpcAppPages.SupportedPages);
+        Assert.Contains("catalog-editor", IpcAppPages.SupportedPages);
+        Assert.Equal("catalog-editor", IpcAppPages.NormalizePageName("Catalog-Editor"));
+        Assert.Equal("catalog-editor", IpcAppPages.ToPageName(nameof(PageType.CatalogEditor)));
+        Assert.Equal("catalog", IpcAppPages.NormalizePageName(" Catalog "));
+        Assert.Equal("catalog", IpcAppPages.ToPageName(nameof(PageType.Catalog)));
+    }
+}

@@ -1,0 +1,834 @@
+using System.Collections.ObjectModel;
+using System.Net.Http;
+using System.Windows.Input;
+using Avalonia.Automation;
+using Avalonia.Media.Imaging;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Avalonia.Views;
+using UniGetUI.Core.Language;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.SettingsEngine;
+using UniGetUI.Core.SettingsEngine.SecureSettings;
+using UniGetUI.Core.Tools;
+using UniGetUI.Core.Tools.Scheduling;
+using UniGetUI.PackageEngine.AgentBroker;
+using UniGetUI.PackageEngine.Classes.Packages.Classes;
+using UniGetUI.PackageEngine.Enums;
+using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.Operations;
+using UniGetUI.PackageEngine.PackageClasses;
+using UniGetUI.PackageEngine.Serializable;
+
+namespace UniGetUI.Avalonia.ViewModels;
+
+public partial class InstallOptionsViewModel : ObservableObject
+{
+    // ── Public result ──────────────────────────────────────────────────────────
+    public bool ShouldProceedWithOperation { get; private set; }
+    public event EventHandler? CloseRequested;
+
+    private readonly IPackage _package;
+    private readonly InstallOptions _options;
+    private readonly bool _uiLoaded;
+
+    // ── Translated static labels ───────────────────────────────────────────────
+    public string DialogTitle { get; }
+    public string PlaceholderText { get; }
+    public string UnlockLabel { get; } = CoreTools.Translate("Change this and unlock");
+    public string ProfileLabel { get; } = CoreTools.Translate("Operation profile:");
+    public string FollowGlobalLabel { get; } = CoreTools.Translate("Follow the default options when installing, upgrading or uninstalling this package");
+    public string ChangeDefaultOptionsLabel { get; } = CoreTools.Translate("Change default options");
+    public string GeneralInfoLabel { get; } = CoreTools.Translate("The following settings will be applied each time this package is installed, updated or removed.");
+    public string VersionLabel { get; } = CoreTools.Translate("Version to install:");
+    public string ArchLabel { get; } = CoreTools.Translate("Architecture to install:");
+    public string ScopeLabel { get; } = CoreTools.Translate("Installation scope:");
+    public string LocationLabel { get; } = CoreTools.Translate("Install location:");
+    public string SelectDirLabel { get; } = CoreTools.Translate("Select");
+    public string ResetDirLabel { get; } = CoreTools.Translate("Reset");
+    public string ParamsInstallLabel { get; } = CoreTools.Translate("Custom install arguments:");
+    public string ParamsUpdateLabel { get; } = CoreTools.Translate("Custom update arguments:");
+    public string ParamsUninstallLabel { get; } = CoreTools.Translate("Custom uninstall arguments:");
+    public string CliArgsHintLabel { get; } = CoreTools.Translate("These fields are independent: an argument set for Install won't apply to Update or Uninstall, and vice versa.");
+    public string LocationPlaceholderHintLabel { get; } = CoreTools.Translate("%PACKAGE% is replaced with the package ID, and %NAME% with the package name.");
+    public string EnvVarSyntaxHintLabel { get; } = Settings.Get(Settings.K.ExpandEnvVarsWithPercentSyntax)
+        ? CoreTools.Translate("Environment variables use %VARIABLE% syntax.")
+        : CoreTools.Translate("Environment variables use <VARIABLE> syntax.");
+    public string ChangeEnvVarSyntaxLabel { get; } = CoreTools.Translate("Change environment variable syntax");
+    public string CopyInstallArgsLabel { get; } = CoreTools.Translate("Copy install arguments to update and uninstall");
+    public string PreInstallLabel { get; } = CoreTools.Translate("Pre-install command:");
+    public string PostInstallLabel { get; } = CoreTools.Translate("Post-install command:");
+    public string AbortInstallLabel { get; } = CoreTools.Translate("Abort install if pre-install command fails");
+    public string PreUpdateLabel { get; } = CoreTools.Translate("Pre-update command:");
+    public string PostUpdateLabel { get; } = CoreTools.Translate("Post-update command:");
+    public string AbortUpdateLabel { get; } = CoreTools.Translate("Abort update if pre-update command fails");
+    public string PreUninstallLabel { get; } = CoreTools.Translate("Pre-uninstall command:");
+    public string PostUninstallLabel { get; } = CoreTools.Translate("Post-uninstall command:");
+    public string AbortUninstallLabel { get; } = CoreTools.Translate("Abort uninstall if pre-uninstall command fails");
+    public string CommandPreviewLabel { get; } = CoreTools.Translate("Command-line to run:");
+    public string SaveLabel { get; } = CoreTools.Translate("Save and close");
+    // Tab headers — icon + two text lines, mirroring the WinUI BetterTabViewItem tabs.
+    public string TabGeneralLine1 { get; } = CoreTools.Translate("General");
+    public string TabGeneralLine2 { get; } = CoreTools.Translate("Version");
+    public string TabLocationLine1 { get; } = CoreTools.Translate("Architecture");
+    public string TabLocationLine2 { get; } = CoreTools.Translate("Location and Scope");
+    public string TabCLILine1 { get; } = CoreTools.Translate("Command-line");
+    public string TabCLILine2 { get; } = CoreTools.Translate("Arguments");
+    public string TabCloseAppsLine1 { get; } = CoreTools.Translate("Close apps");
+    public string TabCloseAppsLine2 { get; } = CoreTools.Translate("before installing");
+    public string TabPrePostLine1 { get; } = CoreTools.Translate("Pre-install");
+    public string TabPrePostLine2 { get; } = CoreTools.Translate("Post-install");
+
+    // Combined accessible names for the tab headers: screen readers announce the
+    // whole tab title, and the second line often carries essential information
+    // (for example "Pre-install — Post-install").
+    public string TabGeneralName { get; } = $"{CoreTools.Translate("General")} — {CoreTools.Translate("Version")}";
+    public string TabLocationName { get; } = $"{CoreTools.Translate("Architecture")} — {CoreTools.Translate("Location and Scope")}";
+    public string TabCLIName { get; } = $"{CoreTools.Translate("Command-line")} — {CoreTools.Translate("Arguments")}";
+    public string TabCloseAppsName { get; } = $"{CoreTools.Translate("Close apps")} — {CoreTools.Translate("before installing")}";
+    public string TabPrePostName { get; } = $"{CoreTools.Translate("Pre-install")} — {CoreTools.Translate("Post-install")}";
+
+    // Close-apps tab labels
+    public string KillProcessesDescriptionLabel { get; } = CoreTools.Translate(
+        "Select the processes that should be closed before this package is installed, updated or uninstalled.");
+    public string KillProcessesPlaceholderLabel { get; } = CoreTools.Translate(
+        "Enter the process names here, separated by commas (,)");
+    public string ForceKillLabelText { get; } = CoreTools.Translate(
+        "Try to kill the processes that refuse to close when requested to");
+
+    // Checkbox content labels
+    public string AdminCheckBox_Content { get; } = CoreTools.Translate("Run as admin");
+    public string InteractiveCheckBox_Content { get; } = CoreTools.Translate("Interactive installation");
+    public string SkipHashCheckBox_Content { get; } = CoreTools.Translate("Skip hash check");
+    public string UninstallPrevCheckBox_Content { get; } = CoreTools.Translate("Uninstall previous versions when updated");
+    public string UninstallBeforeUpdateCheckBox_Content { get; } = CoreTools.Translate("Uninstall, then reinstall when updated");
+    public string SkipMinorCheckBox_Content { get; } = CoreTools.Translate("Skip minor updates for this package");
+    public string SkipMinorLevelPrefix_Content { get; } = CoreTools.Translate("Ignore changes after the first");
+    public string SkipMinorLevelSuffix_Content { get; } = CoreTools.Translate("version numbers");
+    public string SkipMajorCheckBox_Content { get; } = CoreTools.Translate("Skip major updates for this package");
+    public string AutoUpdateCheckBox_Content { get; } = CoreTools.Translate("Automatically update this package");
+    public string IgnoreUpdatesCheckBox_Content { get; } = CoreTools.Translate("Ignore future updates for this package");
+    public string AutoUpdateHint_Content { get; } = BuildAutoUpdateHint();
+
+    // ── Security-gated sections (CLI args & pre/post commands), mirrors WinUI ──
+    public bool CliEnabled { get; }
+    public bool CliDisabledWarningVisible => !CliEnabled;
+    public bool PrePostEnabled { get; }
+    public bool PrePostDisabledWarningVisible => !PrePostEnabled;
+    public string CliDisabledLabel { get; } = CoreTools.Translate("For security reasons, custom command-line arguments are disabled by default. Go to UniGetUI security settings to change this.");
+    public string PrePostDisabledLabel { get; } = CoreTools.Translate("For security reasons, pre-operation and post-operation scripts are disabled by default. Go to UniGetUI security settings to change this.");
+    public string PrePostExplainerLabel { get; } = CoreTools.Translate("You can define the commands that will be run before or after this package is installed, updated or uninstalled. They will be run on a command prompt, so CMD scripts will work here.");
+    public string GoToSecurityLabel { get; } = CoreTools.Translate("Go to UniGetUI security settings");
+
+    // ── Capability flags (for IsEnabled bindings) ─────────────────────────────
+    public bool CanRunAsAdmin { get; }
+    public bool CanRunInteractively { get; }
+    public bool CanSkipHash { get; }
+    public bool CanUninstallPrev { get; }
+    public bool CanUninstallBeforeUpdate { get; }
+    public bool HasCustomScopes { get; }
+    public bool HasCustomLocations { get; }
+
+    // ── Package icon ───────────────────────────────────────────────────────────
+    [ObservableProperty] private Bitmap? _packageIcon;
+
+    // ── Follow-global toggle ───────────────────────────────────────────────────
+    [ObservableProperty] private bool _followGlobal;
+    [ObservableProperty] private bool _isCustomMode;
+    [ObservableProperty] private double _optionsOpacity = 1.0;
+
+    partial void OnFollowGlobalChanged(bool value)
+    {
+        IsCustomMode = !value;
+        OptionsOpacity = value ? 0.35 : 1.0;
+        if (_uiLoaded) _ = RefreshCommandPreviewAsync();
+    }
+
+    // ── Profile combo ──────────────────────────────────────────────────────────
+    public ObservableCollection<string> ProfileOptions { get; } = [];
+
+    [ObservableProperty] private string? _selectedProfile;
+    [ObservableProperty] private string _proceedButtonLabel = "";
+    [ObservableProperty] private string _manualActionLabel = "";
+
+    partial void OnSelectedProfileChanged(string? value)
+    {
+        ProceedButtonLabel = value ?? "";
+        ManualActionLabel = CurrentOp() switch
+        {
+            OperationType.Update => CoreTools.Translate("Manual update"),
+            OperationType.Uninstall => CoreTools.Translate("Manual uninstall"),
+            _ => CoreTools.Translate("Manual install"),
+        };
+        ApplyProfileEnableState();
+        if (_uiLoaded) _ = RefreshCommandPreviewAsync();
+    }
+
+    // ── General tab ───────────────────────────────────────────────────────────
+    [ObservableProperty] private bool _adminChecked;
+    [ObservableProperty] private bool _interactiveChecked;
+    [ObservableProperty] private bool _skipHashChecked;
+    [ObservableProperty] private bool _skipHashEnabled;
+    [ObservableProperty] private bool _uninstallPrevChecked;
+    [ObservableProperty] private bool _uninstallBeforeUpdateChecked;
+
+    [ObservableProperty] private bool _versionEnabled;
+    public ObservableCollection<string> VersionOptions { get; } = [];
+    [ObservableProperty] private string? _selectedVersion;
+    [ObservableProperty] private bool _versionIsTyped;
+    [ObservableProperty] private string _typedVersion = "";
+    public string TypedVersionPlaceholder { get; } = CoreTools.Translate("Latest");
+
+    [ObservableProperty] private bool _skipMinorChecked;
+    // Index 0 => keep first 1 number significant (level 2), 1 => first 2 (level 3), 2 => first 3 (level 4).
+    public ObservableCollection<string> SkipMinorLevelOptions { get; } = ["1", "2", "3"];
+    [ObservableProperty] private int _skipMinorLevelIndex;
+    [ObservableProperty] private bool _skipMajorChecked;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsAutoUpdateHintVisible))]
+    private bool _autoUpdateChecked;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsAutoUpdateHintVisible))]
+    private bool _ignoreUpdatesChecked;
+
+    public bool IsAutoUpdateHintVisible => AutoUpdateChecked && !IgnoreUpdatesChecked;
+
+    partial void OnAdminCheckedChanged(bool value) => Refresh();
+    partial void OnInteractiveCheckedChanged(bool value) => Refresh();
+    partial void OnSkipHashCheckedChanged(bool value) => Refresh();
+    partial void OnSelectedVersionChanged(string? value) => Refresh();
+    partial void OnTypedVersionChanged(string value) => Refresh();
+
+    // ── Architecture / Scope / Location tab ───────────────────────────────────
+    [ObservableProperty] private bool _archEnabled;
+    public ObservableCollection<string> ArchOptions { get; } = [];
+    [ObservableProperty] private string? _selectedArch;
+
+    [ObservableProperty] private bool _scopeEnabled;
+    public ObservableCollection<string> ScopeOptions { get; } = [];
+    [ObservableProperty] private string? _selectedScope;
+
+    [ObservableProperty] private string _locationText = "";
+    [ObservableProperty] private bool _locationEnabled;
+
+    partial void OnSelectedArchChanged(string? value) => Refresh();
+    partial void OnSelectedScopeChanged(string? value) => Refresh();
+    partial void OnLocationTextChanged(string value) => Refresh();
+
+    // ── Package broker notices ────────────────────────────────────────────────
+    /// <summary>Why the Devolutions Agent would reject the current options, one item per line.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(BrokerIssuesVisible))]
+    private string _brokerIssuesText = "";
+
+    public bool BrokerIssuesVisible => BrokerIssuesText.Length > 0;
+
+    public string BrokerIssuesHeaderLabel { get; } = CoreTools.Translate(
+        "These options cannot be used through the Devolutions Agent, which will refuse the operation:");
+
+    /// <summary>Warning about custom WinGet arguments when the operation goes through the Devolutions Agent.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(BrokerCustomArgumentsWarningVisible))]
+    private string _brokerCustomArgumentsWarning = "";
+
+    public bool BrokerCustomArgumentsWarningVisible => BrokerCustomArgumentsWarning.Length > 0;
+
+    // ── CLI params tab ────────────────────────────────────────────────────────
+    [ObservableProperty] private string _paramsInstall = "";
+    [ObservableProperty] private string _paramsUpdate = "";
+    [ObservableProperty] private string _paramsUninstall = "";
+
+    partial void OnParamsInstallChanged(string value) => Refresh();
+    partial void OnParamsUpdateChanged(string value) => Refresh();
+    partial void OnParamsUninstallChanged(string value) => Refresh();
+
+    // ── Pre/Post commands tab ─────────────────────────────────────────────────
+    [ObservableProperty] private string _preInstallText = "";
+    [ObservableProperty] private string _postInstallText = "";
+    [ObservableProperty] private bool _abortInstall;
+
+    [ObservableProperty] private string _preUpdateText = "";
+    [ObservableProperty] private string _postUpdateText = "";
+    [ObservableProperty] private bool _abortUpdate;
+
+    [ObservableProperty] private string _preUninstallText = "";
+    [ObservableProperty] private string _postUninstallText = "";
+    [ObservableProperty] private bool _abortUninstall;
+
+    partial void OnPreInstallTextChanged(string value) => Refresh();
+    partial void OnPostInstallTextChanged(string value) => Refresh();
+    partial void OnPreUpdateTextChanged(string value) => Refresh();
+    partial void OnPostUpdateTextChanged(string value) => Refresh();
+    partial void OnPreUninstallTextChanged(string value) => Refresh();
+    partial void OnPostUninstallTextChanged(string value) => Refresh();
+    // ── Close apps tab ────────────────────────────────────────────────────────
+    public ObservableCollection<KillProcessEntry> KillProcessEntries { get; } = [];
+
+    [ObservableProperty] private string _killProcessNewEntry = "";
+    [ObservableProperty] private bool _forceKillChecked;
+
+    [RelayCommand]
+    private void AddKillProcess()
+    {
+        var name = KillProcessNewEntry.Trim();
+        if (string.IsNullOrEmpty(name)) return;
+        if (!KillProcessEntries.Any(e => e.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            KillProcessEntries.Add(new KillProcessEntry(name, e => KillProcessEntries.Remove(e)));
+        KillProcessNewEntry = "";
+    }
+
+    // ── Command preview ───────────────────────────────────────────────────────
+    [ObservableProperty] private string _commandPreview = "";
+
+    // ── Constructor ───────────────────────────────────────────────────────────
+    public InstallOptionsViewModel(IPackage package, OperationType operation, InstallOptions options)
+    {
+        _package = package;
+        _options = options;
+        var caps = package.Manager.Capabilities;
+
+        DialogTitle = CoreTools.Translate("{0} installation options", package.Name);
+        PlaceholderText = CoreTools.Translate(
+            "{0} Install options are currently locked because {0} follows the default install options.",
+            package.Name);
+
+        // Capability flags
+        CanRunAsAdmin = OperatingSystem.IsWindows() && caps.CanRunAsAdmin;
+        CanRunInteractively = caps.CanRunInteractively;
+        CanSkipHash = caps.CanSkipIntegrityChecks;
+        CanUninstallPrev = caps.CanUninstallPreviousVersionsAfterUpdate;
+        CanUninstallBeforeUpdate = PackageOperation.SupportsUninstallBeforeUpdate(package);
+        HasCustomScopes = caps.SupportsCustomScopes;
+        HasCustomLocations = caps.SupportsCustomLocations;
+
+        // Security-gated sections (disabled by default; toggled in security settings)
+        CliEnabled = SecureSettings.Get(SecureSettings.K.AllowCLIArguments);
+        PrePostEnabled = SecureSettings.Get(SecureSettings.K.AllowPrePostOpCommand);
+
+        // Profile
+        string installLabel = CoreTools.Translate("Install");
+        string updateLabel = CoreTools.Translate("Update");
+        string uninstallLabel = CoreTools.Translate("Uninstall");
+        ProfileOptions.Add(installLabel);
+        ProfileOptions.Add(updateLabel);
+        ProfileOptions.Add(uninstallLabel);
+        SelectedProfile = operation switch
+        {
+            OperationType.Update => updateLabel,
+            OperationType.Uninstall => uninstallLabel,
+            _ => installLabel,
+        };
+        ProceedButtonLabel = SelectedProfile;
+
+        // Follow-global
+        FollowGlobal = !options.OverridesNextLevelOpts;
+        IsCustomMode = options.OverridesNextLevelOpts;
+        OptionsOpacity = options.OverridesNextLevelOpts ? 1.0 : 0.35;
+
+        // General checkboxes
+        AdminChecked = options.RunAsAdministrator;
+        InteractiveChecked = options.InteractiveInstallation;
+        SkipHashChecked = options.SkipHashCheck;
+        SkipHashEnabled = caps.CanSkipIntegrityChecks;
+        UninstallPrevChecked = options.UninstallPreviousVersionsOnUpdate;
+        UninstallBeforeUpdateChecked = options.UninstallBeforeUpdate;
+        SkipMinorChecked = options.SkipMinorUpdates;
+        SkipMinorLevelIndex = options.SkipMinorUpdatesLevel - 2; // level is validated to 2..4 by the getter
+        SkipMajorChecked = options.SkipMajorUpdates;
+        AutoUpdateChecked = AutoUpdatesDatabase.IsAutoUpdated(package);
+
+        // Version
+        VersionOptions.Add(CoreTools.Translate("Latest"));
+        if (caps.SupportsPreRelease)
+            VersionOptions.Add(CoreTools.Translate("PreRelease"));
+        SelectedVersion = options.PreRelease
+            ? CoreTools.Translate("PreRelease")
+            : CoreTools.Translate("Latest");
+        VersionEnabled = caps.SupportsCustomVersions || caps.SupportsPreRelease;
+        VersionIsTyped = caps.SupportsCustomVersions && !caps.CanListVersions;
+        TypedVersion = options.Version;
+
+        // Architecture
+        string defaultLabel = CoreTools.Translate("Default");
+        ArchOptions.Add(defaultLabel);
+        SelectedArch = defaultLabel;
+        if (caps.SupportsCustomArchitectures)
+        {
+            foreach (var arch in caps.SupportedCustomArchitectures)
+            {
+                ArchOptions.Add(arch);
+                if (options.Architecture == arch) SelectedArch = arch;
+            }
+        }
+        ArchEnabled = caps.SupportsCustomArchitectures;
+
+        // Scope
+        ScopeOptions.Add(CoreTools.Translate("Default"));
+        SelectedScope = CoreTools.Translate("Default");
+        if (caps.SupportsCustomScopes)
+        {
+            string localName = CoreTools.Translate(CommonTranslations.ScopeNames[PackageScope.Local]);
+            string globalName = CoreTools.Translate(CommonTranslations.ScopeNames[PackageScope.Global]);
+            ScopeOptions.Add(localName);
+            ScopeOptions.Add(globalName);
+            if (options.InstallationScope == PackageScope.Local) SelectedScope = localName;
+            if (options.InstallationScope == PackageScope.Global) SelectedScope = globalName;
+        }
+        ScopeEnabled = caps.SupportsCustomScopes;
+
+        // Location
+        LocationText = options.CustomInstallLocation;
+        LocationEnabled = caps.SupportsCustomLocations;
+
+        // CLI params
+        ParamsInstall = string.Join(' ', options.CustomParameters_Install);
+        ParamsUpdate = string.Join(' ', options.CustomParameters_Update);
+        ParamsUninstall = string.Join(' ', options.CustomParameters_Uninstall);
+
+        // Pre/Post commands
+        PreInstallText = options.PreInstallCommand;
+        PostInstallText = options.PostInstallCommand;
+        AbortInstall = options.AbortOnPreInstallFail;
+        PreUpdateText = options.PreUpdateCommand;
+        PostUpdateText = options.PostUpdateCommand;
+        AbortUpdate = options.AbortOnPreUpdateFail;
+        PreUninstallText = options.PreUninstallCommand;
+        PostUninstallText = options.PostUninstallCommand;
+        AbortUninstall = options.AbortOnPreUninstallFail;
+
+        // Close apps
+        foreach (var proc in options.KillBeforeOperation)
+            KillProcessEntries.Add(new KillProcessEntry(proc, e => KillProcessEntries.Remove(e)));
+        // Close-app entries are part of the brokered request, so changes re-check its rules.
+        KillProcessEntries.CollectionChanged += (_, _) => Refresh();
+        ForceKillChecked = Settings.Get(Settings.K.KillProcessesThatRefuseToDie);
+
+        // Show fallback immediately, then replace with real icon if available
+        PackageIcon = BitmapLoader.TryLoadAsset(_fallbackIconUri);
+        _ = LoadIconAsync();
+
+        if (caps.SupportsCustomVersions && caps.CanListVersions)
+            _ = LoadVersionsAsync(options.Version);
+
+        _ = LoadIgnoredUpdatesAsync();
+
+        _uiLoaded = true;
+        // Apply the operation-dependent enable gates for the initial operation, matching
+        // WinUI's EnableDisableControls (which runs on load): e.g. Skip-hash/Architecture are
+        // disabled for Uninstall, Version is enabled only for Install.
+        ApplyProfileEnableState();
+        _ = RefreshCommandPreviewAsync();
+    }
+
+    // ── Commands ──────────────────────────────────────────────────────────────
+
+    /// <summary>Captures the current UI state into the options object without closing.</summary>
+    public void ApplyChanges() => ApplyToOptions();
+
+    [RelayCommand]
+    private void Save()
+    {
+        ApplyToOptions();
+        CloseRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    [RelayCommand]
+    private void Proceed()
+    {
+        ApplyToOptions();
+        ShouldProceedWithOperation = true;
+        CloseRequested?.Invoke(this, EventArgs.Empty);
+    }
+
+    [RelayCommand]
+    private void ResetLocation() => LocationText = "";
+
+    [RelayCommand]
+    private void CopyInstallArgsToOthers()
+    {
+        ParamsUpdate = ParamsInstall;
+        ParamsUninstall = ParamsInstall;
+    }
+
+    /// <summary>Unlocks the options by turning off "follow default options" (matches WinUI).</summary>
+    [RelayCommand]
+    private void Unlock() => FollowGlobal = false;
+
+    /// <summary>Closes the dialog and opens the manager's default-options settings (matches WinUI).</summary>
+    [RelayCommand]
+    private void ChangeDefaultOptions()
+    {
+        CloseRequested?.Invoke(this, EventArgs.Empty);
+        if (MainWindow.Instance?.DataContext is MainWindowViewModel vm)
+            vm.OpenManagerSettings(_package.Manager);
+    }
+
+    /// <summary>Closes the dialog and opens the security settings page (matches WinUI).</summary>
+    [RelayCommand]
+    private void GoToSecuritySettings()
+    {
+        CloseRequested?.Invoke(this, EventArgs.Empty);
+        if (MainWindow.Instance?.DataContext is MainWindowViewModel vm)
+            vm.OpenSettingsPage(typeof(Views.Pages.SettingsPages.Administrator));
+    }
+
+    [RelayCommand]
+    private void GoToOperationsSettings()
+    {
+        ApplyToOptions();
+        CloseRequested?.Invoke(this, EventArgs.Empty);
+        if (MainWindow.Instance?.DataContext is MainWindowViewModel vm)
+            vm.OpenSettingsPage(typeof(Views.Pages.SettingsPages.Operations));
+    }
+
+    // ── Ignore-future-updates state (package-level, like WinUI) ────────────────
+    private async Task LoadIgnoredUpdatesAsync()
+    {
+        try { IgnoreUpdatesChecked = await _package.HasUpdatesIgnoredAsync(); }
+        catch (Exception ex) { Logger.Warn($"[InstallOptionsViewModel] Failed to read ignored-updates state: {ex.Message}"); }
+    }
+
+    private async Task ApplyIgnoredUpdatesAsync()
+    {
+        try
+        {
+            if (IgnoreUpdatesChecked)
+                await _package.AddToIgnoredUpdatesAsync("*");
+            else if (await _package.GetIgnoredUpdatesVersionAsync() == "*")
+                await _package.RemoveFromIgnoredUpdatesAsync();
+        }
+        catch (Exception ex) { Logger.Warn($"[InstallOptionsViewModel] Failed to apply ignored-updates state: {ex.Message}"); }
+    }
+
+    private static string BuildAutoUpdateHint()
+    {
+        var schedule = MaintenanceScheduleStore.Get(MaintenanceTaskKind.InstallUpdates);
+
+        if (!schedule.Enabled)
+            return CoreTools.Translate("Turn on \"Install available updates\" in the scheduled maintenance settings for this to take effect.");
+
+        if (schedule.InstallTargets is ScheduleInstallTargets.AllPackages)
+            return CoreTools.Translate("Every upgradable package is already installed automatically, so this changes nothing until the scheduled task is limited to marked packages.");
+
+        return CoreTools.Translate("This package will be updated when the scheduled maintenance task runs.");
+    }
+
+    private void ApplyAutoUpdate()
+    {
+        try
+        {
+            string id = AutoUpdatesDatabase.GetIdForPackage(_package);
+            if (AutoUpdateChecked)
+                AutoUpdatesDatabase.Add(id);
+            else if (AutoUpdatesDatabase.IsAutoUpdated(id))
+                AutoUpdatesDatabase.Remove(id);
+        }
+        catch (Exception ex) { Logger.Warn($"[InstallOptionsViewModel] Failed to apply automatic-update state: {ex.Message}"); }
+    }
+
+    // ── Enable/disable based on selected operation profile ────────────────────
+    private void ApplyProfileEnableState()
+    {
+        if (!_uiLoaded) return;
+        var op = CurrentOp();
+        var caps = _package.Manager.Capabilities;
+
+        SkipHashEnabled = op is not OperationType.Uninstall && caps.CanSkipIntegrityChecks;
+        ArchEnabled = op is not OperationType.Uninstall && caps.SupportsCustomArchitectures;
+        VersionEnabled = op is OperationType.Install && (caps.SupportsCustomVersions || caps.SupportsPreRelease);
+        ScopeEnabled = caps.SupportsCustomScopes && op switch
+        {
+            OperationType.Update => caps.SupportsCustomScopesOnUpdate,
+            OperationType.Uninstall => caps.SupportsCustomScopesOnUninstall,
+            _ => true,
+        };
+    }
+
+    // ── Live command preview ──────────────────────────────────────────────────
+    private async Task RefreshCommandPreviewAsync()
+    {
+        if (!_uiLoaded) return;
+        // Edits start overlapping refreshes; only the latest one may publish its results.
+        int generation = Interlocked.Increment(ref _refreshGeneration);
+        string command = await BuildCurrentCommandAsync();
+        if (generation != _refreshGeneration) return;
+        CommandPreview = command;
+        await RefreshBrokerNoticesAsync(generation);
+    }
+
+    /// <summary>
+    /// When the operation goes through the Devolutions Agent, explains the options it would
+    /// reject and warns about custom WinGet installer arguments, using the same rules as the
+    /// request builder so the user can fix them before starting the operation.
+    /// </summary>
+    private int _refreshGeneration;
+
+    private async Task RefreshBrokerNoticesAsync(int generation)
+    {
+        if (!IsBrokered(_package))
+        {
+            BrokerIssuesText = "";
+            BrokerCustomArgumentsWarning = "";
+            return;
+        }
+
+        var op = CurrentOp();
+        string issuesText;
+        string customArgumentsWarning;
+        try
+        {
+            var applied = await InstallOptionsFactory.LoadApplicableAsync(_package, overridePackageOptions: SnapshotOptions());
+            // Resolve the location exactly as the brokered operation will (for WinGet updates
+            // this may be the registry-detected location rather than the configured one).
+            var issues = await Task.Run(() =>
+            {
+                // Apply the manager's own elevation requirements first, as the brokered
+                // operation does (e.g. a WinGet installer that must run elevated).
+                _package.Manager.OperationHelper.ApplyElevationRequirements(_package, applied, op);
+                return BrokerRequestBuilder.FindProblems(
+                    _package,
+                    applied,
+                    op,
+                    PackageOperation.GetBrokerInstallLocation(_package, applied, op));
+            });
+            issuesText = string.Join(Environment.NewLine, issues.Select(issue => "• " + issue));
+            customArgumentsWarning = DescribeBrokerCustomArgumentsRisk(applied, op);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"[InstallOptionsViewModel] Could not check the options against the package broker rules: {ex.Message}");
+            issuesText = "";
+            customArgumentsWarning = "";
+        }
+
+        if (generation != _refreshGeneration)
+            return;
+
+        // Assigning bound text is not reliably announced, so route changes through the app's
+        // live region. Assigning an unchanged value is a no-op, which suppresses repeats.
+        if (issuesText != BrokerIssuesText && issuesText.Length > 0)
+            AccessibilityAnnouncementService.Announce(
+                $"{BrokerIssuesHeaderLabel} {issuesText}",
+                AutomationLiveSetting.Assertive);
+        if (customArgumentsWarning != BrokerCustomArgumentsWarning && customArgumentsWarning.Length > 0)
+            AccessibilityAnnouncementService.Announce(customArgumentsWarning, AutomationLiveSetting.Polite);
+
+        BrokerIssuesText = issuesText;
+        BrokerCustomArgumentsWarning = customArgumentsWarning;
+    }
+
+    private string DescribeBrokerCustomArgumentsRisk(InstallOptions applied, OperationType op)
+    {
+        if (!_package.Manager.Name.Equals("Winget", StringComparison.OrdinalIgnoreCase))
+            return "";
+
+        if (BrokerRequestValidator.UsesWinGetInstallerArguments(_package, applied, op))
+            return CoreTools.Translate(
+                "--override and --custom pass arbitrary arguments to the package installer. Through the Devolutions Agent, the installer can run with administrator rights, so your organization's policy may block these arguments.");
+
+        List<string> parameters = op switch
+        {
+            OperationType.Update => applied.CustomParameters_Update,
+            OperationType.Uninstall => applied.CustomParameters_Uninstall,
+            _ => applied.CustomParameters_Install,
+        };
+
+        // Same elevation predicate as the brokered operation: the package's own requirement
+        // (e.g. a WinGet installer that needs elevation) counts as well as the checkbox.
+        bool runsElevated = BrokerRequestValidator.RequestsElevation(_package, applied);
+
+        return parameters.Any(parameter => !string.IsNullOrWhiteSpace(parameter)) && runsElevated
+            ? CoreTools.Translate(
+                "Custom arguments are passed to WinGet by the Devolutions Agent, which runs this operation with administrator rights. Your organization's policy may block custom arguments.")
+            : "";
+    }
+
+    private static bool IsBrokered(IPackage package) =>
+        Settings.Get(Settings.K.UseAgentBroker)
+        && BrokerRequestBuilder.SupportsManager(package.Manager.Name)
+        && !package.Source.IsVirtualManager;
+
+    /// <summary>Builds the CLI command for the currently selected operation and options,
+    /// identical to the live preview. Used by the Copy / Open-in-terminal actions.</summary>
+    public async Task<string> BuildCurrentCommandAsync()
+    {
+        var snap = SnapshotOptions();
+        var op = CurrentOp();
+        var applied = await InstallOptionsFactory.LoadApplicableAsync(_package, overridePackageOptions: snap);
+        try
+        {
+            var args = await Task.Run(() =>
+                _package.Manager.OperationHelper.GetStandaloneParameters(_package, applied, op));
+            return _package.Manager.Properties.ExecutableFriendlyName + " " + string.Join(' ', args);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Logger.Warn($"[InstallOptionsViewModel] No command line for {_package.Id}: {ex.Message}");
+            return "";
+        }
+    }
+
+    private void Refresh() { if (_uiLoaded) _ = RefreshCommandPreviewAsync(); }
+
+    // ── Package icon ──────────────────────────────────────────────────────────
+    private static readonly HttpClient _iconHttp = new(CoreTools.GenericHttpClientParameters);
+
+    private static readonly Uri _fallbackIconUri =
+        new("avares://UniGetUI/Assets/package_color.png");
+
+    private async Task LoadIconAsync()
+    {
+        try
+        {
+            var uri = await Task.Run(_package.GetIconUrlIfAny);
+            if (uri is null) return;
+
+            Bitmap bmp;
+            if (uri.IsFile)
+                bmp = BitmapLoader.LoadFile(uri.LocalPath);
+            else if (uri.Scheme is "http" or "https")
+            {
+                var bytes = await _iconHttp.GetByteArrayAsync(uri);
+                using var ms = new MemoryStream(bytes);
+                bmp = new Bitmap(ms);
+            }
+            else return;
+
+            PackageIcon = bmp;
+        }
+        catch (Exception ex) { Logger.Warn($"[InstallOptionsViewModel] Failed to load icon for {_package.Id}: {ex.Message}"); }
+    }
+
+    // ── Async version loader ──────────────────────────────────────────────────
+    private async Task LoadVersionsAsync(string selectedVersion)
+    {
+        VersionEnabled = false;
+        var versions = await Task.Run(() => _package.Manager.DetailsHelper.GetVersions(_package));
+        foreach (var ver in versions)
+        {
+            VersionOptions.Add(ver);
+            if (selectedVersion == ver)
+                SelectedVersion = ver;
+        }
+        var op = CurrentOp();
+        VersionEnabled = op is OperationType.Install &&
+            (_package.Manager.Capabilities.SupportsCustomVersions ||
+             _package.Manager.Capabilities.SupportsPreRelease);
+    }
+
+    // ── Snapshot & apply ──────────────────────────────────────────────────────
+    private OperationType CurrentOp() => SelectedProfile switch
+    {
+        var s when s == CoreTools.Translate("Update") => OperationType.Update,
+        var s when s == CoreTools.Translate("Uninstall") => OperationType.Uninstall,
+        _ => OperationType.Install,
+    };
+
+    private InstallOptions SnapshotOptions()
+    {
+        var o = new InstallOptions();
+        o.RunAsAdministrator = AdminChecked;
+        o.InteractiveInstallation = InteractiveChecked;
+        o.SkipHashCheck = SkipHashChecked;
+        o.UninstallPreviousVersionsOnUpdate = UninstallPrevChecked;
+        o.UninstallBeforeUpdate = UninstallBeforeUpdateChecked;
+        o.SkipMinorUpdates = SkipMinorChecked;
+        o.SkipMinorUpdatesLevel = SkipMinorLevelIndex + 2;
+        o.SkipMajorUpdates = SkipMajorChecked;
+        o.OverridesNextLevelOpts = !FollowGlobal;
+
+        var ver = SelectedVersion ?? "";
+        o.PreRelease = ver == CoreTools.Translate("PreRelease");
+        o.Version = (ver != CoreTools.Translate("Latest") && ver != CoreTools.Translate("PreRelease") && ver.Length > 0) ? ver : "";
+        if (VersionIsTyped)
+            o.Version = TypedVersion.Trim();
+
+        string defaultLabel = CoreTools.Translate("Default");
+        o.Architecture = (SelectedArch != defaultLabel && SelectedArch is not null) ? SelectedArch : "";
+        o.InstallationScope = ScopeToString(SelectedScope);
+
+        o.CustomInstallLocation = LocationText;
+        o.CustomParameters_Install = Split(ParamsInstall);
+        o.CustomParameters_Update = Split(ParamsUpdate);
+        o.CustomParameters_Uninstall = Split(ParamsUninstall);
+        o.PreInstallCommand = PreInstallText;
+        o.PostInstallCommand = PostInstallText;
+        o.AbortOnPreInstallFail = AbortInstall;
+        o.PreUpdateCommand = PreUpdateText;
+        o.PostUpdateCommand = PostUpdateText;
+        o.AbortOnPreUpdateFail = AbortUpdate;
+        o.PreUninstallCommand = PreUninstallText;
+        o.PostUninstallCommand = PostUninstallText;
+        o.AbortOnPreUninstallFail = AbortUninstall;
+        o.KillBeforeOperation = KillProcessEntries.Select(e => e.Name).ToList();
+        return o;
+    }
+
+    private void ApplyToOptions()
+    {
+        AddKillProcess(); // flush any process name typed but not yet committed to a chip
+        var s = SnapshotOptions();
+        _options.RunAsAdministrator = s.RunAsAdministrator;
+        _options.InteractiveInstallation = s.InteractiveInstallation;
+        _options.SkipHashCheck = s.SkipHashCheck;
+        _options.UninstallPreviousVersionsOnUpdate = s.UninstallPreviousVersionsOnUpdate;
+        _options.UninstallBeforeUpdate = s.UninstallBeforeUpdate;
+        _options.SkipMinorUpdates = s.SkipMinorUpdates;
+        _options.SkipMinorUpdatesLevel = s.SkipMinorUpdatesLevel;
+        _options.SkipMajorUpdates = s.SkipMajorUpdates;
+        _options.OverridesNextLevelOpts = s.OverridesNextLevelOpts;
+        _options.PreRelease = s.PreRelease;
+        _options.Version = s.Version;
+        _options.Architecture = s.Architecture;
+        _options.InstallationScope = s.InstallationScope;
+        _options.CustomInstallLocation = s.CustomInstallLocation;
+        _options.CustomParameters_Install = s.CustomParameters_Install;
+        _options.CustomParameters_Update = s.CustomParameters_Update;
+        _options.CustomParameters_Uninstall = s.CustomParameters_Uninstall;
+        _options.PreInstallCommand = s.PreInstallCommand;
+        _options.PostInstallCommand = s.PostInstallCommand;
+        _options.AbortOnPreInstallFail = s.AbortOnPreInstallFail;
+        _options.PreUpdateCommand = s.PreUpdateCommand;
+        _options.PostUpdateCommand = s.PostUpdateCommand;
+        _options.AbortOnPreUpdateFail = s.AbortOnPreUpdateFail;
+        _options.PreUninstallCommand = s.PreUninstallCommand;
+        _options.PostUninstallCommand = s.PostUninstallCommand;
+        _options.AbortOnPreUninstallFail = s.AbortOnPreUninstallFail;
+        _options.KillBeforeOperation = KillProcessEntries.Select(e => e.Name).ToList();
+        Settings.Set(Settings.K.KillProcessesThatRefuseToDie, ForceKillChecked);
+        _ = ApplyIgnoredUpdatesAsync();
+        ApplyAutoUpdate();
+    }
+
+    private static string ScopeToString(string? selected)
+    {
+        if (selected == CoreTools.Translate(CommonTranslations.ScopeNames[PackageScope.Local])) return PackageScope.Local;
+        if (selected == CoreTools.Translate(CommonTranslations.ScopeNames[PackageScope.Global])) return PackageScope.Global;
+        return "";
+    }
+
+    private static List<string> Split(string text)
+        => text.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
+}
+
+/// <summary>A single entry in the "close apps before installing" list.</summary>
+public sealed class KillProcessEntry
+{
+    public string Name { get; }
+    public ICommand RemoveCommand { get; }
+
+    public KillProcessEntry(string name, Action<KillProcessEntry> remove)
+    {
+        Name = name;
+        RemoveCommand = new SyncCommand(() => remove(this));
+    }
+
+    private sealed class SyncCommand(Action action) : ICommand
+    {
+        public event EventHandler? CanExecuteChanged { add { } remove { } }
+        public bool CanExecute(object? _) => true;
+        public void Execute(object? _) => action();
+    }
+}

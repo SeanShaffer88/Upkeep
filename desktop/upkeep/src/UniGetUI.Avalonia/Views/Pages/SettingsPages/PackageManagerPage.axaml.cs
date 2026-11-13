@@ -1,0 +1,839 @@
+using Avalonia.Automation;
+using Avalonia.Controls;
+using Avalonia.Input.Platform;
+using Avalonia.Layout;
+using Avalonia.Media;
+using Avalonia.Platform.Storage;
+using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Avalonia.ViewModels;
+using UniGetUI.Avalonia.ViewModels.Pages.SettingsPages;
+using UniGetUI.Avalonia.Views.Controls;
+using UniGetUI.Avalonia.Views.Controls.Settings;
+using UniGetUI.Avalonia.Views.DialogPages;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.SettingsEngine.SecureSettings;
+using UniGetUI.Core.Tools;
+using UniGetUI.Interface.Enums;
+using UniGetUI.PackageEngine.Interfaces;
+using UniGetUI.PackageEngine.ManagerClasses.Manager;
+using UniGetUI.PackageEngine.Managers.PipManager;
+using UniGetUI.PackageEngine.Managers.VcpkgManager;
+using CoreSettings = UniGetUI.Core.SettingsEngine.Settings;
+using CornerRadius = global::Avalonia.CornerRadius;
+using Thickness = global::Avalonia.Thickness;
+
+namespace UniGetUI.Avalonia.Views.Pages.SettingsPages;
+
+public sealed partial class PackageManagerPage : UserControl, ISettingsPage
+{
+    private PackageManagerViewModel ViewModel => (PackageManagerViewModel)DataContext!;
+
+    public bool CanGoBack => true;
+    public string ShortTitle => ViewModel.PageTitle;
+
+    public event EventHandler? RestartRequired;
+    public event EventHandler<Type>? NavigationRequested;
+
+    public PackageManagerPage(IPackageManager manager)
+    {
+        DataContext = new PackageManagerViewModel(manager);
+        InitializeComponent();
+
+        ViewModel.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName is nameof(PackageManagerViewModel.Severity)
+                                or nameof(PackageManagerViewModel.StatusTitle)
+                                or nameof(PackageManagerViewModel.StatusMessage))
+                ApplyStatusBrushes();
+        };
+
+        ViewModel.RestartRequired += (s, e) => RestartRequired?.Invoke(s, e);
+        ViewModel.NavigateToAdministratorRequested += (_, _) => NavigationRequested?.Invoke(this, typeof(Administrator));
+
+        BuildPage();
+        ApplyStatusBrushes();
+    }
+
+    // ── Dynamic UI construction ───────────────────────────────────────────────
+
+    private void BuildPage()
+    {
+        var manager = ViewModel.Manager;
+
+        // ── Enable/Disable toggle
+        EnableManager.DictionaryName = CoreSettings.K.DisabledManagers;
+        EnableManager.KeyName = manager.Name;
+        EnableManager.Text = CoreTools.Translate("Enable {pm}").Replace("{pm}", manager.DisplayName);
+        ExtraControls.IsEnabled = manager.IsEnabled();
+        EnableManager.StateChanged += (_, _) =>
+        {
+            ExtraControls.IsEnabled = manager.IsEnabled();
+            _ = ViewModel.ReloadManagerCommand.ExecuteAsync(null);
+        };
+
+        BuildExecutableCards(manager);
+
+        {
+            // ── Install options panel
+            var installOptions = new InstallOptionsPanel(manager);
+            installOptions.NavigateToAdministratorRequested += (_, _) =>
+                NavigationRequested?.Invoke(this, typeof(Administrator));
+            InstallOptionsHolder.Content = installOptions;
+
+            // ── Disable notifications card
+            var disableNotifsCard = new CheckboxCard_Dict
+            {
+                Text = CoreTools.Translate("Ignore packages from {pm} when showing a notification about updates")
+                               .Replace("{pm}", manager.DisplayName),
+                DictionaryName = CoreSettings.K.DisabledPackageManagerNotifications,
+                ForceInversion = true,
+                KeyName = manager.Name,
+            };
+
+            BuildExtraControls(disableNotifsCard);
+
+            // ── Per-manager minimum update age
+            ExtraControls.Children.Add(new TextBlock
+            {
+                Margin = new Thickness(44, 24, 4, 8),
+                FontWeight = FontWeight.SemiBold,
+                Text = CoreTools.Translate("Update security"),
+            });
+
+            (string Label, string Value)[] ageItems =
+            [
+                (CoreTools.Translate("Use global setting"), ""),
+            (CoreTools.Translate("No minimum age"), "0"),
+            (CoreTools.Translate("1 day"), "1"),
+            (CoreTools.Translate("{0} days", 3), "3"),
+            (CoreTools.Translate("{0} days", 7), "7"),
+            (CoreTools.Translate("{0} days", 14), "14"),
+            (CoreTools.Translate("{0} days", 30), "30"),
+            (CoreTools.Translate("Custom..."), "custom"),
+        ];
+
+            var ageCombo = new ComboBox
+            {
+                MinWidth = 200,
+                MinHeight = 32,
+                CornerRadius = new CornerRadius(4),
+                Padding = new Thickness(10, 4, 8, 5),
+            };
+            AutomationProperties.SetName(ageCombo, CoreTools.Translate("Minimum age for updates"));
+            foreach (var (label, _) in ageItems)
+                ageCombo.Items.Add(label);
+
+            string? savedAge = CoreSettings.GetDictionaryItem<string, string>(
+                CoreSettings.K.PerManagerMinimumUpdateAge, manager.Name);
+            int savedAgeIdx = Array.FindIndex(ageItems, i => i.Value == (savedAge ?? ""));
+            ageCombo.SelectedIndex = savedAgeIdx >= 0 ? savedAgeIdx : 0;
+
+            var customAgeInput = new TextBox
+            {
+                MinWidth = 200,
+                Classes = { "search-field-standalone" },
+                PlaceholderText = CoreTools.Translate("e.g. 10"),
+                [AutomationProperties.NameProperty] = CoreTools.Translate("Custom minimum age (days)"),
+                Text = CoreSettings.GetDictionaryItem<string, string>(
+                    CoreSettings.K.PerManagerMinimumUpdateAgeCustom, manager.Name) ?? "",
+            };
+            customAgeInput.TextChanged += (_, _) =>
+            {
+                string current = customAgeInput.Text ?? "";
+                string filtered = string.Concat(current.Where(char.IsDigit));
+                if (filtered != current)
+                {
+                    customAgeInput.Text = filtered;
+                    return;
+                }
+                if (filtered.Length > 0)
+                    CoreSettings.SetDictionaryItem(
+                        CoreSettings.K.PerManagerMinimumUpdateAgeCustom, manager.Name, filtered);
+                else
+                    CoreSettings.RemoveDictionaryKey<string, string>(
+                        CoreSettings.K.PerManagerMinimumUpdateAgeCustom, manager.Name);
+            };
+
+            bool initiallyCustom = savedAge == "custom";
+            var releaseDateSupport = manager.Capabilities.KnowsPackageReleaseDate;
+            bool ageSupported = releaseDateSupport != PackageReleaseDateSupport.No;
+            object ageDescription = releaseDateSupport switch
+            {
+                PackageReleaseDateSupport.No => new TextBlock
+                {
+                    Text = CoreTools.Translate("{pm} does not provide release dates for its packages, so this setting will have no effect")
+                                   .Replace("{pm}", manager.DisplayName),
+                    Foreground = new SolidColorBrush(Color.Parse("#e05252")),
+                    TextWrapping = TextWrapping.Wrap,
+                    FontSize = 12,
+                },
+                PackageReleaseDateSupport.Partial => new TextBlock
+                {
+                    Text = CoreTools.Translate("{pm} only provides release dates for some of its packages, so this setting will only apply to those packages")
+                                   .Replace("{pm}", manager.DisplayName),
+                    Foreground = new SolidColorBrush(Color.FromRgb(224, 168, 0)),
+                    TextWrapping = TextWrapping.Wrap,
+                    FontSize = 12,
+                },
+                _ => CoreTools.Translate("Override the global minimum update age for this package manager"),
+            };
+
+            ageCombo.IsEnabled = ageSupported;
+            customAgeInput.IsEnabled = ageSupported;
+
+            var minimumAgeCard = new SettingsCard
+            {
+                Header = CoreTools.Translate("Minimum age for updates"),
+                Description = ageDescription,
+                Content = ageCombo,
+                CornerRadius = initiallyCustom ? new CornerRadius(8, 8, 0, 0) : new CornerRadius(8),
+                BorderThickness = new Thickness(1),
+            };
+            var customAgeCard = new SettingsCard
+            {
+                Header = CoreTools.Translate("Custom minimum age (days)"),
+                Content = customAgeInput,
+                IsVisible = initiallyCustom,
+                CornerRadius = new CornerRadius(0, 0, 8, 8),
+                BorderThickness = new Thickness(1, 0, 1, 1),
+            };
+
+            ageCombo.SelectionChanged += (_, _) =>
+            {
+                int idx = ageCombo.SelectedIndex;
+                if (idx < 0) return;
+                string val = ageItems[idx].Value;
+
+                bool isCustom = val == "custom";
+                customAgeCard.IsVisible = isCustom;
+                minimumAgeCard.CornerRadius = isCustom ? new CornerRadius(8, 8, 0, 0) : new CornerRadius(8);
+
+                if (string.IsNullOrEmpty(val))
+                    CoreSettings.RemoveDictionaryKey<string, string>(
+                        CoreSettings.K.PerManagerMinimumUpdateAge, manager.Name);
+                else
+                    CoreSettings.SetDictionaryItem(
+                        CoreSettings.K.PerManagerMinimumUpdateAge, manager.Name, val);
+            };
+
+            ExtraControls.Children.Add(minimumAgeCard);
+            ExtraControls.Children.Add(customAgeCard);
+        }
+
+        // ── Logs card
+        ManagerLogs.Text = CoreTools.Translate("View {0} logs", manager.DisplayName);
+        ManagerLogs.Icon = UniGetUI.Interface.Enums.IconType.Console;
+        ManagerLogs.Click += (_, _) =>
+        {
+            if (TopLevel.GetTopLevel(this) is Window { DataContext: MainWindowViewModel vm })
+                vm.OpenManagerLogs(manager);
+        };
+
+        // ── pip AppExecution Alias warning
+        if (manager.Name == "Pip")
+        {
+            ManagerLogs.CornerRadius = new CornerRadius(8, 8, 0, 0);
+            AppExecutionAliasWarning.IsVisible = true;
+            AppExecutionAliasLabel.Text = CoreTools.Translate(
+                "If Python cannot be found or is not listing packages but is installed on the system, " +
+                "you may need to disable the \"python.exe\" App Execution Alias in the settings.");
+        }
+    }
+
+    private void BuildExecutableCards(IPackageManager manager)
+    {
+        // ── Executable picker card
+        bool customPathsAllowed = SecureSettings.Get(SecureSettings.K.AllowCustomManagerPaths);
+        var execGrid = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions("*,Auto"),
+            RowDefinitions = new RowDefinitions("Auto,Auto,Auto"),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+        };
+
+        var execHint = new TextBlock
+        {
+            Text = CoreTools.Translate("Not finding the file you are looking for? Browse to it or make sure it has been added to PATH."),
+            FontSize = 12,
+            FontWeight = FontWeight.SemiBold,
+            Opacity = 0.7,
+            TextWrapping = TextWrapping.Wrap,
+        };
+        Grid.SetColumnSpan(execHint, 2);
+        execGrid.Children.Add(execHint);
+
+        var execCombo = new ComboBox
+        {
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            MinHeight = 32,
+            CornerRadius = new CornerRadius(4),
+            Padding = new Thickness(10, 4, 8, 5),
+        };
+        AutomationProperties.SetName(execCombo, CoreTools.Translate("Select the executable to be used. The following list shows the executables found by UniGetUI"));
+        foreach (var path in ViewModel.CandidateExecutables)
+            AddExecutablePathItem(execCombo, path);
+
+        string savedPath = CoreSettings.GetDictionaryItem<string, string>(CoreSettings.K.ManagerPaths, manager.Name) ?? "";
+        if (!string.IsNullOrEmpty(savedPath) && File.Exists(savedPath))
+            AddExecutablePathItem(execCombo, savedPath);
+        var (executableFound, executablePath) = manager.GetExecutableFile();
+        execCombo.SelectedItem = executableFound ? executablePath : "";
+        execCombo.IsEnabled = customPathsAllowed;
+        execCombo.SelectionChanged += (s, _) =>
+        {
+            if (s is ComboBox combo && combo.SelectedItem?.ToString() is { Length: > 0 } selected)
+                ViewModel.OnExecutableSelected(selected);
+        };
+        Grid.SetRow(execCombo, 1);
+        Grid.SetColumn(execCombo, 0);
+        execGrid.Children.Add(execCombo);
+
+        var browseExecutableButton = new Button
+        {
+            Content = CoreTools.Translate("Browse..."),
+            IsEnabled = customPathsAllowed,
+            Margin = new Thickness(8, 0, 0, 0),
+            MinWidth = 96,
+            Classes = { "secondary-action" },
+        };
+        browseExecutableButton.Click += async (_, _) =>
+        {
+            if (TopLevel.GetTopLevel(this) is not { } topLevel) return;
+            var files = await topLevel.StorageProvider.OpenFilePickerAsync(
+                new FilePickerOpenOptions
+                {
+                    AllowMultiple = false,
+                    Title = CoreTools.Translate("Select executable"),
+                    FileTypeFilter = GetExecutableFileTypeFilter(),
+                });
+            if (files is not [{ } file]) return;
+
+            string? path = file.TryGetLocalPath();
+            if (string.IsNullOrWhiteSpace(path)) return;
+
+            AddExecutablePathItem(execCombo, path);
+            execCombo.SelectedItem = path;
+        };
+        Grid.SetRow(browseExecutableButton, 1);
+        Grid.SetColumn(browseExecutableButton, 1);
+        execGrid.Children.Add(browseExecutableButton);
+
+        if (!customPathsAllowed)
+        {
+            var (securityWarning, goToSecureBtn) = BuildCustomPathsWarning();
+            Grid.SetRow(securityWarning, 2);
+            execGrid.Children.Add(securityWarning);
+            Grid.SetRow(goToSecureBtn, 2);
+            Grid.SetColumn(goToSecureBtn, 1);
+            execGrid.Children.Add(goToSecureBtn);
+        }
+
+        ExecutableHolder.Content = new SettingsCard
+        {
+            BorderThickness = new Thickness(1, 0, 1, 0),
+            CornerRadius = new CornerRadius(0),
+            Header = CoreTools.Translate("Select the executable to be used. The following list shows the executables found by UniGetUI"),
+            Description = execGrid,
+            Margin = new Thickness(0, 2, 0, 2),
+        };
+
+        // ── Current path card
+        var copyIcon = new SvgIcon
+        {
+            Path = "avares://UniGetUI/Assets/Symbols/copy.svg",
+            Width = 24,
+            Height = 24,
+        };
+        var copyBtn = new Button
+        {
+            Content = copyIcon,
+            Padding = new Thickness(8),
+            VerticalAlignment = VerticalAlignment.Center,
+            Background = Brushes.Transparent,
+            BorderThickness = new Thickness(0),
+        };
+        AutomationProperties.SetName(copyBtn, CoreTools.Translate("Copy path"));
+        var pathCard = new SettingsCard
+        {
+            BorderThickness = new Thickness(1, 0, 1, 1),
+            CornerRadius = new CornerRadius(0, 0, 8, 8),
+            Header = CoreTools.Translate("Current executable file:"),
+            Content = copyBtn,
+        };
+        var pathLabel = new TextBlock
+        {
+            FontFamily = new FontFamily("Consolas,Cascadia Mono,Menlo,monospace"),
+            FontSize = 14,
+            TextWrapping = TextWrapping.Wrap,
+        };
+        pathLabel.Text = ViewModel.PathLabelText;
+        ViewModel.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(PackageManagerViewModel.PathLabelText))
+                pathLabel.Text = ViewModel.PathLabelText;
+        };
+        pathCard.Description = pathLabel;
+        copyBtn.Click += (_, _) => _ = CopyPathAndFlashIcon(pathLabel.Text, copyBtn, copyIcon);
+        PathHolder.Content = pathCard;
+    }
+
+    private static IReadOnlyList<FilePickerFileType> GetExecutableFileTypeFilter()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return [new FilePickerFileType(CoreTools.Translate("All files")) { Patterns = ["*"] }];
+        }
+
+        return
+        [
+            new FilePickerFileType(CoreTools.Translate("Executable")) { Patterns = ["*.exe"] },
+            new FilePickerFileType(CoreTools.Translate("All files")) { Patterns = ["*"] },
+        ];
+    }
+
+    private static void AddExecutablePathItem(ComboBox comboBox, string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return;
+
+        foreach (object? item in comboBox.Items)
+        {
+            if (string.Equals(item?.ToString(), path, StringComparison.OrdinalIgnoreCase))
+                return;
+        }
+
+        comboBox.Items.Add(path);
+    }
+
+    private void BuildExtraControls(CheckboxCard_Dict disableNotifsCard)
+    {
+        ExtraControls.Children.Clear();
+        var manager = ViewModel.Manager;
+        bool managerHasSources = manager.Capabilities.SupportsCustomSources && manager.Name != "vcpkg"
+            && manager.Capabilities.Sources.CanBeEdited;
+
+        if (managerHasSources)
+        {
+            ExtraControls.Children.Add(new SourceManagerCard(manager)
+            {
+                Margin = new Thickness(0, 0, 0, 16),
+            });
+            ExtraControls.Children.Add(new TextBlock
+            {
+                Margin = new Thickness(44, 24, 4, 8),
+                FontWeight = FontWeight.SemiBold,
+                Text = CoreTools.Translate("Advanced options"),
+            });
+        }
+
+        switch (manager.Name)
+        {
+            case "Winget":
+                disableNotifsCard.CornerRadius = new CornerRadius(8, 8, 0, 0);
+                disableNotifsCard.BorderThickness = new Thickness(1, 1, 1, 0);
+                ExtraControls.Children.Add(disableNotifsCard);
+
+                var wingetCliToolPreference = new ComboboxCard
+                {
+                    Text = CoreTools.Translate("WinGet command-line tool"),
+                    Description = CoreTools.Translate(
+                        "Choose which command-line tool UniGetUI uses for WinGet operations when the COM API is not used"
+                    ),
+                    SettingName = CoreSettings.K.WinGetCliToolPreference,
+                    CornerRadius = new CornerRadius(0),
+                    BorderThickness = new Thickness(1, 0, 1, 1),
+                };
+                wingetCliToolPreference.AddItem("Default", "default");
+                wingetCliToolPreference.AddItem("WinGet", "winget", false);
+                wingetCliToolPreference.AddItem("Pinget", "pinget", false);
+                wingetCliToolPreference.ShowAddedItems();
+                wingetCliToolPreference.ValueChanged += (_, _) =>
+                    _ = ViewModel.ReloadManagerCommand.ExecuteAsync(null);
+                ExtraControls.Children.Add(wingetCliToolPreference);
+
+                var wingetComApiPolicy = new ComboboxCard
+                {
+                    Text = CoreTools.Translate("WinGet COM API"),
+                    Description = CoreTools.Translate(
+                        "Choose whether UniGetUI can use the WinGet COM API before falling back to the command-line tool"
+                    ),
+                    SettingName = CoreSettings.K.WinGetComApiPolicy,
+                    CornerRadius = new CornerRadius(0),
+                    BorderThickness = new Thickness(1, 0, 1, 1),
+                };
+                wingetComApiPolicy.AddItem("Default", "default");
+                wingetComApiPolicy.AddItem("Enabled", "enabled");
+                wingetComApiPolicy.AddItem("Disabled", "disabled");
+                wingetComApiPolicy.ShowAddedItems();
+                wingetComApiPolicy.ValueChanged += (_, _) =>
+                    _ = ViewModel.ReloadManagerCommand.ExecuteAsync(null);
+                ExtraControls.Children.Add(wingetComApiPolicy);
+
+                var wingetResetBtn = new ButtonCard
+                {
+                    Text = CoreTools.Translate("Reset WinGet")
+                        + $" ({CoreTools.Translate("This may help if no packages are listed")})",
+                    ButtonText = CoreTools.AutoTranslated("Reset"),
+                    CornerRadius = new CornerRadius(0),
+                    BorderThickness = new Thickness(1, 0, 1, 1),
+                };
+                wingetResetBtn.Click += (_, _) => _ = AvaloniaPackageOperationHelper.HandleBrokenWinGetAsync();
+                ExtraControls.Children.Add(wingetResetBtn);
+
+                ExtraControls.Children.Add(new CheckboxCard
+                {
+                    Text = CoreTools.Translate("Force install location parameter when updating packages with custom locations"),
+                    SettingName = CoreSettings.K.WinGetForceLocationOnUpdate,
+                    CornerRadius = new CornerRadius(0),
+                    BorderThickness = new Thickness(1, 0, 1, 1),
+                });
+
+                ExtraControls.Children.Add(new CheckboxCard
+                {
+                    Text = CoreTools.Translate("Download full package manifest alongside the installer"),
+                    SettingName = CoreSettings.K.WinGetDownloadFullManifest,
+                    CornerRadius = new CornerRadius(0),
+                    BorderThickness = new Thickness(1, 0, 1, 1),
+                });
+
+                ExtraControls.Children.Add(new TextboxCard
+                {
+                    Text = CoreTools.Translate("Stop offering an update that never applies after this many attempts"),
+                    Description = CoreTools.Translate("When WinGet keeps offering an update that reports success without ever changing the installed version, stop offering it after this many attempts, until a newer version is available (default: 3)"),
+                    SettingName = CoreSettings.K.WinGetStuckUpgradeThreshold,
+                    IsNumericOnly = true,
+                    Placeholder = "3",
+                    CornerRadius = new CornerRadius(0, 0, 8, 8),
+                    BorderThickness = new Thickness(1, 0, 1, 1),
+                });
+
+                break;
+
+            case "Scoop":
+                disableNotifsCard.CornerRadius = new CornerRadius(8, 8, 0, 0);
+                disableNotifsCard.BorderThickness = new Thickness(1, 1, 1, 0);
+                ExtraControls.Children.Add(disableNotifsCard);
+
+                var scoopInstall = new ButtonCard
+                {
+                    Text = CoreTools.AutoTranslated("Install Scoop"),
+                    ButtonText = CoreTools.AutoTranslated("Install"),
+                    CornerRadius = new CornerRadius(0),
+                };
+                scoopInstall.Click += (_, _) => ViewModel.ScoopInstallCommand.Execute(null);
+                ExtraControls.Children.Add(scoopInstall);
+
+                var scoopUninstall = new ButtonCard
+                {
+                    Text = CoreTools.AutoTranslated("Uninstall Scoop (and its packages)"),
+                    ButtonText = CoreTools.AutoTranslated("Uninstall"),
+                    CornerRadius = new CornerRadius(0),
+                    BorderThickness = new Thickness(1, 0, 1, 0),
+                };
+                scoopUninstall.Click += (_, _) => ViewModel.ScoopUninstallCommand.Execute(null);
+                ExtraControls.Children.Add(scoopUninstall);
+
+                var scoopCleanup = new ButtonCard
+                {
+                    Text = CoreTools.AutoTranslated("Run cleanup and clear cache"),
+                    ButtonText = CoreTools.AutoTranslated("Run"),
+                    CornerRadius = new CornerRadius(0),
+                };
+                scoopCleanup.Click += (_, _) => ViewModel.ScoopCleanupCommand.Execute(null);
+                ExtraControls.Children.Add(scoopCleanup);
+
+                // Clear download cache on launch
+                ExtraControls.Children.Add(new CheckboxCard
+                {
+                    CornerRadius = new CornerRadius(0),
+                    BorderThickness = new Thickness(1, 0, 1, 0),
+                    SettingName = CoreSettings.K.EnableScoopCleanupCache,
+                    Text = CoreTools.AutoTranslated("Clear Scoop download cache on launch"),
+                });
+
+                // Clean up older app versions on launch
+                ExtraControls.Children.Add(new CheckboxCard
+                {
+                    CornerRadius = new CornerRadius(0, 0, 8, 8),
+                    BorderThickness = new Thickness(1, 0, 1, 1),
+                    SettingName = CoreSettings.K.EnableScoopCleanupApps,
+                    Text = CoreTools.AutoTranslated("Clean up older Scoop app versions on launch"),
+                });
+                break;
+
+            case "Bun":
+                disableNotifsCard.CornerRadius = new CornerRadius(8, 8, 0, 0);
+                disableNotifsCard.BorderThickness = new Thickness(1, 1, 1, 0);
+                ExtraControls.Children.Add(disableNotifsCard);
+
+                ExtraControls.Children.Add(new CheckboxCard
+                {
+                    CornerRadius = new CornerRadius(0, 0, 8, 8),
+                    BorderThickness = new Thickness(1, 0, 1, 1),
+                    SettingName = CoreSettings.K.BunPreferLatestVersions,
+                    Text = CoreTools.Translate("Prefer latest versions (may include breaking changes) instead of recommended safe updates"),
+                });
+                break;
+
+            case "Pip":
+                disableNotifsCard.CornerRadius = new CornerRadius(8, 8, 0, 0);
+                disableNotifsCard.BorderThickness = new Thickness(1, 1, 1, 0);
+                ExtraControls.Children.Add(disableNotifsCard);
+                ExtraControls.Children.Add(BuildPythonEnvironmentsCard());
+                break;
+
+            case "vcpkg":
+                disableNotifsCard.CornerRadius = new CornerRadius(8, 8, 0, 0);
+                disableNotifsCard.BorderThickness = new Thickness(1, 1, 1, 0);
+                ExtraControls.Children.Add(disableNotifsCard);
+
+                CoreSettings.SetValue(CoreSettings.K.DefaultVcpkgTriplet, Vcpkg.GetDefaultTriplet());
+                var vcpkgTriplet = new ComboboxCard
+                {
+                    Text = CoreTools.Translate("Default vcpkg triplet"),
+                    SettingName = CoreSettings.K.DefaultVcpkgTriplet,
+                    CornerRadius = new CornerRadius(0),
+                };
+                foreach (string triplet in Vcpkg.GetSystemTriplets())
+                    vcpkgTriplet.AddItem(triplet, triplet, false);
+                vcpkgTriplet.ShowAddedItems();
+                ExtraControls.Children.Add(vcpkgTriplet);
+                ExtraControls.Children.Add(BuildVcpkgRootCard());
+                break;
+
+            default:
+                disableNotifsCard.CornerRadius = new CornerRadius(8);
+                disableNotifsCard.BorderThickness = new Thickness(1);
+                ExtraControls.Children.Add(disableNotifsCard);
+                break;
+        }
+    }
+
+    private SettingsCard BuildPythonEnvironmentsCard()
+    {
+        var rows = new StackPanel { Spacing = 8, Margin = new Thickness(0, 8, 0, 0) };
+        var description = new StackPanel { Spacing = 4 };
+        description.Children.Add(new TextBlock
+        {
+            Text = CoreTools.Translate("UniGetUI only manages the Python environments checked below. Virtual environments, conda environments and embedded Pythons usually belong to other apps, so they are not managed unless you check them."),
+            FontSize = 12,
+            Opacity = 0.7,
+            TextWrapping = TextWrapping.Wrap,
+        });
+        description.Children.Add(rows);
+
+        if (!Pip.CanOptInEnvironments())
+        {
+            var gate = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto") };
+            var (warning, change) = BuildCustomPathsWarning();
+            gate.Children.Add(warning);
+            Grid.SetColumn(change, 1);
+            gate.Children.Add(change);
+            description.Children.Add(gate);
+        }
+
+        void Fill()
+        {
+            rows.Children.Clear();
+            List<string> interpreters = [];
+            string savedPath = CoreSettings.GetDictionaryItem<string, string>(CoreSettings.K.ManagerPaths, ViewModel.Manager.Name) ?? "";
+            foreach (string path in ViewModel.CandidateExecutables.Append(savedPath).Append(ViewModel.Manager.Status.ExecutablePath))
+            {
+                if (path.Length > 0 && File.Exists(path) && !interpreters.Any(known => Pip.IsSameEnvironment(known, path)))
+                    interpreters.Add(path);
+            }
+
+            if (interpreters.Count == 0)
+            {
+                rows.Children.Add(new TextBlock
+                {
+                    Text = CoreTools.Translate("No Python interpreters were found"),
+                    FontSize = 12,
+                });
+                return;
+            }
+
+            foreach (string path in interpreters)
+                rows.Children.Add(BuildPythonEnvironmentRow(path));
+        }
+
+        Fill();
+        rows.IsEnabled = !ViewModel.IsLoading;
+        ViewModel.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName != nameof(PackageManagerViewModel.IsLoading))
+                return;
+
+            rows.IsEnabled = !ViewModel.IsLoading;
+            if (!ViewModel.IsLoading)
+                Fill();
+        };
+
+        return new SettingsCard
+        {
+            Header = CoreTools.Translate("Python environments"),
+            Description = description,
+            CornerRadius = new CornerRadius(0, 0, 8, 8),
+            BorderThickness = new Thickness(1, 0, 1, 1),
+        };
+    }
+
+    private Grid BuildPythonEnvironmentRow(string path)
+    {
+        PythonEnvironmentKind kind = Pip.ClassifyEnvironment(path);
+        string kindText = kind switch
+        {
+            PythonEnvironmentKind.VirtualEnvironment => CoreTools.Translate("Virtual environment"),
+            PythonEnvironmentKind.CondaEnvironment => CoreTools.Translate("Conda environment"),
+            PythonEnvironmentKind.Embedded => CoreTools.Translate("Embedded Python"),
+            PythonEnvironmentKind.StoreAlias => CoreTools.Translate("Microsoft Store alias"),
+            PythonEnvironmentKind.Unknown => CoreTools.Translate("Unrecognized Python"),
+            _ => CoreTools.Translate("System Python"),
+        };
+        if (Pip.IsSameEnvironment(ViewModel.Manager.Status.ExecutablePath, path))
+            kindText += " · " + CoreTools.Translate("In use");
+
+        var row = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto") };
+        var labels = new StackPanel { Spacing = 2 };
+        labels.Children.Add(new TextBlock
+        {
+            Text = path,
+            FontFamily = new FontFamily("Consolas,Cascadia Mono,Menlo,monospace"),
+            TextWrapping = TextWrapping.Wrap,
+        });
+        labels.Children.Add(new TextBlock
+        {
+            Text = kindText,
+            FontSize = 12,
+            Opacity = 0.7,
+        });
+        row.Children.Add(labels);
+
+        var manage = new CheckBox
+        {
+            Content = CoreTools.Translate("Manage"),
+            IsChecked = Pip.IsEnvironmentManaged(path, kind)
+                || (ViewModel.Manager is Pip pip && pip.IsChosenExecutable(path)),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(8, 0, 0, 0),
+        };
+        manage.IsEnabled = Pip.CanOptInEnvironments() || Pip.IsManagedByDefault(kind) || manage.IsChecked == true;
+        AutomationProperties.SetName(manage, CoreTools.Translate("Manage the Python environment at {0}", path));
+        manage.IsCheckedChanged += (_, _) =>
+        {
+            Pip.SetEnvironmentManaged(path, manage.IsChecked == true);
+            _ = ViewModel.ReloadManagerCommand.ExecuteAsync(null);
+        };
+        Grid.SetColumn(manage, 1);
+        row.Children.Add(manage);
+        return row;
+    }
+
+    private (TextBlock Warning, Button Change) BuildCustomPathsWarning()
+    {
+        var warning = new TextBlock
+        {
+            Text = CoreTools.Translate("For security reasons, changing the executable file is disabled by default"),
+            FontSize = 12,
+            FontWeight = FontWeight.SemiBold,
+            Opacity = 0.7,
+            TextWrapping = TextWrapping.Wrap,
+            Classes = { "setting-warning-text" },
+        };
+        var change = new Button
+        {
+            Content = new TextBlock { Text = CoreTools.Translate("Change this"), FontSize = 12, Classes = { "hyperlink" } },
+            Background = Brushes.Transparent,
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(0),
+        };
+        change.Click += (_, _) => ViewModel.NavigateToAdministratorCommand.Execute(null);
+        return (warning, change);
+    }
+
+    private ButtonCard BuildVcpkgRootCard()
+    {
+        var vcpkgRootCard = new ButtonCard
+        {
+            Text = CoreTools.AutoTranslated("Change vcpkg root location"),
+            ButtonText = CoreTools.AutoTranslated("Select"),
+            CornerRadius = new CornerRadius(0, 0, 8, 8),
+            BorderThickness = new Thickness(1, 0, 1, 1),
+        };
+
+        var rootLabel = new TextBlock
+        {
+            VerticalAlignment = VerticalAlignment.Center,
+            Text = ViewModel.VcpkgRootPath,
+        };
+        var resetBtn = new Button
+        {
+            Content = CoreTools.Translate("Reset"),
+            IsEnabled = ViewModel.IsCustomVcpkgRootSet,
+            Margin = new Thickness(4, 0),
+            Classes = { "secondary-action" },
+        };
+        AutomationProperties.SetName(resetBtn, CoreTools.Translate("Reset vcpkg root location"));
+        var openBtn = new Button
+        {
+            Content = CoreTools.Translate("Open"),
+            IsEnabled = ViewModel.IsCustomVcpkgRootSet,
+            Margin = new Thickness(4, 0),
+            Classes = { "secondary-action" },
+        };
+        AutomationProperties.SetName(openBtn, CoreTools.Translate("Open vcpkg root location"));
+
+        ViewModel.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(PackageManagerViewModel.VcpkgRootPath))
+                rootLabel.Text = ViewModel.VcpkgRootPath;
+            if (e.PropertyName == nameof(PackageManagerViewModel.IsCustomVcpkgRootSet))
+            {
+                resetBtn.IsEnabled = ViewModel.IsCustomVcpkgRootSet;
+                openBtn.IsEnabled = ViewModel.IsCustomVcpkgRootSet;
+            }
+        };
+
+        resetBtn.Click += (_, _) => ViewModel.ResetVcpkgRootCommand.Execute(null);
+        openBtn.Click += (_, _) => ViewModel.OpenVcpkgRootCommand.Execute(null);
+
+        var descPanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
+        descPanel.Children.Add(rootLabel);
+        descPanel.Children.Add(resetBtn);
+        descPanel.Children.Add(openBtn);
+        vcpkgRootCard.Description = descPanel;
+
+        vcpkgRootCard.Command = ViewModel.PickVcpkgRootCommand;
+        vcpkgRootCard.CommandParameter = vcpkgRootCard;
+        return vcpkgRootCard;
+    }
+
+    // ── View-only: brush lookup (needs ActualThemeVariant) ───────────────────
+
+    private void ApplyStatusBrushes()
+    {
+        StatusBar.Classes.Remove("status-success");
+        StatusBar.Classes.Remove("status-warning");
+        StatusBar.Classes.Remove("status-error");
+        StatusBar.Classes.Remove("status-info");
+
+        string cls = ViewModel.Severity switch
+        {
+            ManagerStatusSeverity.Success => "status-success",
+            ManagerStatusSeverity.Warning => "status-warning",
+            ManagerStatusSeverity.Error => "status-error",
+            _ => "status-info",
+        };
+        StatusBar.Classes.Add(cls);
+    }
+
+    private async Task CopyPathAndFlashIcon(string? text, Button btn, SvgIcon icon)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+        if (TopLevel.GetTopLevel(this)?.Clipboard is { } clipboard)
+            await clipboard.SetTextAsync(text);
+        btn.Content = new TextBlock { Text = "✓", FontSize = 20, VerticalAlignment = VerticalAlignment.Center };
+        await Task.Delay(1000);
+        btn.Content = icon;
+    }
+}

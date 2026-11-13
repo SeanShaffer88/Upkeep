@@ -1,0 +1,485 @@
+using System.Collections.ObjectModel;
+using Avalonia.Automation;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Avalonia.Models;
+using UniGetUI.Core.Logging;
+using UniGetUI.Core.Tools;
+using UniGetUI.PackageEngine;
+using UniGetUI.PackageEngine.Interfaces;
+
+namespace UniGetUI.Avalonia.ViewModels;
+
+public partial class CatalogEditorCatalog : ViewModelBase
+{
+    [ObservableProperty]
+    private string _id;
+
+    [ObservableProperty]
+    private string _name;
+
+    public ObservableCollection<CatalogEntry> Packages { get; }
+
+    // A folder or https location of macOS packages that fills the catalog, edited from the Package feed dialog.
+    [ObservableProperty]
+    private string? _pkgFeed;
+
+    [ObservableProperty]
+    private bool? _allowUnsignedPackages;
+
+    public CatalogEditorCatalog(CatalogDefinition definition)
+    {
+        _id = definition.Id;
+        _name = definition.Name;
+        Packages = new(definition.Packages);
+        _pkgFeed = definition.PkgFeed;
+        _allowUnsignedPackages = definition.AllowUnsignedPackages;
+    }
+
+    public CatalogDefinition ToDefinition() => new()
+    {
+        Id = Id,
+        Name = Name,
+        Packages = Packages.ToArray(),
+        PkgFeed = PkgFeed,
+        AllowUnsignedPackages = AllowUnsignedPackages
+    };
+}
+
+public sealed record CatalogAddResult(CatalogEditorCatalog Catalog, int Added, int AlreadyPresent);
+
+public partial class CatalogEditorViewModel : ViewModelBase
+{
+    public ObservableCollection<CatalogEditorCatalog> Catalogs { get; } = [];
+    public ObservableCollection<IPackageManager> Managers { get; } = [];
+    public ObservableCollection<CatalogEntry> SearchResults { get; } = [];
+
+    [ObservableProperty]
+    private CatalogEditorCatalog? _selectedCatalog;
+
+    [ObservableProperty]
+    private IPackageManager? _selectedManager;
+
+    [ObservableProperty]
+    private CatalogEntry? _selectedPackage;
+
+    [ObservableProperty]
+    private CatalogEntry? _selectedResult;
+
+    [ObservableProperty]
+    private string _query = "";
+
+    [ObservableProperty]
+    private string _filePath = "";
+
+    private string _message = "";
+
+    private readonly Action<string?, AutomationLiveSetting> _announce;
+
+    public string Message
+    {
+        get => _message;
+        set => SetMessage(value);
+    }
+
+    public CatalogEditorViewModel() : this(AccessibilityAnnouncementService.Announce) { }
+
+    internal CatalogEditorViewModel(Action<string?, AutomationLiveSetting> announce) => _announce = announce;
+
+    /// <summary>Raised with the text of every error, so the view can show it to the user.</summary>
+    public event Action<string>? ErrorRaised;
+
+    public void SetErrorMessage(string message)
+    {
+        SetMessage(message, AutomationLiveSetting.Assertive);
+        ErrorRaised?.Invoke(message);
+    }
+
+    private void SetMessage(string message, AutomationLiveSetting liveSetting = AutomationLiveSetting.Polite)
+    {
+        if (SetProperty(ref _message, message, nameof(Message)) && !string.IsNullOrWhiteSpace(message))
+            _announce(message, liveSetting);
+    }
+
+    [ObservableProperty]
+    private bool _isDirty;
+
+    [ObservableProperty]
+    private bool _isLoaded;
+
+    [ObservableProperty]
+    private bool _isBusy;
+
+    [ObservableProperty]
+    private bool _isSearching;
+
+    private bool _loading;
+    private Task<bool>? _initialLoad;
+    private CatalogDefinition[] _savedCatalogs = [];
+
+    public Task<bool> EnsureLoadedAsync()
+    {
+        if (IsLoaded) return Task.FromResult(true);
+        // A failed load is retried on the next visit, so a file fixed or deployed later is picked up.
+        if (_initialLoad is { IsCompleted: true } done && !done.Result) _initialLoad = null;
+        return _initialLoad ??= LoadOrStartAsync(FilePath);
+    }
+
+    // The editor starts on an untitled, empty document rather than the deployed catalog, so nobody
+    // edits what this device installs from by accident; New catalog or Open file is the first step.
+    // A path set beforehand that does not exist yet also starts empty, and saves there.
+    private Task<bool> LoadOrStartAsync(string path)
+    {
+        if (path.Length > 0 && !IsMissing(path)) return LoadAsync(path);
+        SelectedCatalog = null;
+        Catalogs.Clear();
+        FilePath = path.Length > 0 ? Path.GetFullPath(path) : "";
+        _savedCatalogs = [];
+        IsLoaded = true;
+        IsDirty = false;
+        return Task.FromResult(true);
+    }
+
+    internal static bool IsMissing(string path)
+    {
+        if (File.Exists(path)) return false;
+        try
+        {
+            using (File.OpenRead(path)) return false;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public void NewDocument()
+    {
+        SelectedCatalog = null;
+        Catalogs.Clear();
+        FilePath = "";
+        _savedCatalogs = [];
+        IsLoaded = true;
+        IsDirty = true;
+        Message = "";
+        NewCatalog();
+    }
+
+    public int AddPackages(IEnumerable<IPackage> packages)
+    {
+        if (!CanEdit || SelectedCatalog is not { } catalog)
+            throw new InvalidOperationException(CoreTools.Translate("Open or create a catalog before adding packages."));
+        return AddPackages(packages, [catalog])[0].Added;
+    }
+
+    /// <summary>
+    /// Adds <paramref name="packages"/> to each of <paramref name="catalogs"/>, skipping ones a catalog
+    /// already holds, and reports what happened per catalog.
+    /// </summary>
+    public IReadOnlyList<CatalogAddResult> AddPackages(IEnumerable<IPackage> packages, IReadOnlyList<CatalogEditorCatalog> catalogs)
+    {
+        if (!CanEdit || catalogs.Count == 0 || catalogs.Any(c => !Catalogs.Contains(c)))
+            throw new InvalidOperationException(CoreTools.Translate("Open or create a catalog before adding packages."));
+        var selection = packages.ToList();
+        var results = new List<CatalogAddResult>();
+        foreach (var catalog in catalogs)
+        {
+            int added = 0;
+            foreach (var package in selection)
+            {
+                if (catalog.Packages.Any(p => p.Matches(package))) continue;
+                catalog.Packages.Add(CatalogEntry.FromPackage(package));
+                added++;
+            }
+            results.Add(new CatalogAddResult(catalog, added, selection.Count - added));
+        }
+        Message = results.Count == 1
+            ? AddedToCatalogMessage(results[0].Added, results[0].Catalog.Name)
+            : results.Sum(r => r.Added) == 1
+                ? CoreTools.Translate("1 package added to {0} catalogs. Save the catalog to keep your changes.", results.Count)
+                : CoreTools.Translate("{0} packages added to {1} catalogs. Save the catalog to keep your changes.", results.Sum(r => r.Added), results.Count);
+        return results;
+    }
+
+    internal static string AddedToCatalogMessage(int added, string catalogName) => added == 1
+        ? CoreTools.Translate("1 package added to catalog {0}. Save the catalog to keep your changes.", catalogName)
+        : CoreTools.Translate("{0} packages added to catalog {1}. Save the catalog to keep your changes.", added, catalogName);
+
+    public bool CanEdit => IsLoaded && !IsBusy;
+    public bool CanDiscardChanges => CanEdit && IsDirty;
+    public bool HasSelectedCatalog => SelectedCatalog is not null;
+    public bool CanAddPackage => CanEdit && HasSelectedCatalog && SelectedResult is not null;
+    public bool CanRemovePackage => CanEdit && HasSelectedCatalog && SelectedPackage is not null;
+    public bool CanSearch => CanEdit && !IsSearching && SelectedManager is not null && !string.IsNullOrWhiteSpace(Query);
+
+    partial void OnIsLoadedChanged(bool value) => UpdateAvailability();
+    partial void OnIsDirtyChanged(bool value) => OnPropertyChanged(nameof(CanDiscardChanges));
+    partial void OnIsBusyChanged(bool value) => UpdateAvailability();
+    partial void OnIsSearchingChanged(bool value) => UpdateAvailability();
+    partial void OnQueryChanged(string value) => UpdateAvailability();
+    partial void OnSelectedManagerChanged(IPackageManager? value)
+    {
+        SearchCommand.Cancel();
+        SearchResults.Clear();
+        SelectedResult = null;
+        UpdateAvailability();
+    }
+
+    partial void OnSelectedCatalogChanged(CatalogEditorCatalog? value)
+    {
+        SelectedPackage = null;
+        OnPropertyChanged(nameof(HasSelectedCatalog));
+        UpdateAvailability();
+    }
+
+    partial void OnSelectedResultChanged(CatalogEntry? value) => UpdateAvailability();
+    partial void OnSelectedPackageChanged(CatalogEntry? value) => UpdateAvailability();
+
+    private void UpdateAvailability()
+    {
+        OnPropertyChanged(nameof(CanEdit));
+        OnPropertyChanged(nameof(CanDiscardChanges));
+        OnPropertyChanged(nameof(CanSearch));
+        OnPropertyChanged(nameof(CanAddPackage));
+        OnPropertyChanged(nameof(CanRemovePackage));
+        SearchCommand.NotifyCanExecuteChanged();
+    }
+
+    public void RefreshManagers()
+    {
+        var selectedId = SelectedManager?.Id;
+        Managers.Clear();
+        foreach (var manager in PEInterface.Managers.Where(m => m.IsReady()))
+            Managers.Add(manager);
+        SelectedManager = Managers.FirstOrDefault(m => m.Id == selectedId) ?? Managers.FirstOrDefault();
+        if (Managers.Count == 0 && Message.Length == 0)
+            Message = CoreTools.Translate("No package managers are ready. Enable a package manager before searching.");
+    }
+
+    private void Attach(CatalogEditorCatalog catalog)
+    {
+        catalog.PropertyChanged += (_, _) => { if (!_loading) IsDirty = true; };
+        catalog.Packages.CollectionChanged += (_, _) => { if (!_loading) IsDirty = true; };
+    }
+
+    public async Task<bool> LoadAsync(string path)
+    {
+        IsBusy = true;
+        Message = "";
+        try
+        {
+            var definitions = await SoftwareCatalog.LoadAsync(path);
+            SearchCommand.Cancel();
+            _loading = true;
+            SelectedCatalog = null;
+            Catalogs.Clear();
+            SearchResults.Clear();
+            SelectedResult = null;
+            foreach (var definition in definitions)
+            {
+                var catalog = new CatalogEditorCatalog(definition);
+                Attach(catalog);
+                Catalogs.Add(catalog);
+            }
+            SelectedCatalog = Catalogs.FirstOrDefault();
+            FilePath = Path.GetFullPath(path);
+            _savedCatalogs = CopyCatalogs(definitions);
+            IsLoaded = true;
+            IsDirty = false;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Could not open catalog file {path}.");
+            Logger.Error(ex);
+            SetErrorMessage(CoreTools.Translate("Could not open catalog file {0}: {1}", path, ex.Message));
+            return false;
+        }
+        finally
+        {
+            _loading = false;
+            IsBusy = false;
+        }
+    }
+
+    public async Task<bool> SaveAsync(string path)
+    {
+        IsBusy = true;
+        Message = "";
+        try
+        {
+            var definitions = CopyCatalogs(Catalogs.Select(c => c.ToDefinition()));
+            try
+            {
+                // The machine-wide folder belongs to UniGetUI; create it on first save (as an administrator when needed).
+                if (string.Equals(Path.GetFullPath(path), Path.GetFullPath(SoftwareCatalog.FilePath),
+                        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+                    Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+                await SoftwareCatalog.SaveAsync(path, definitions);
+            }
+            catch (UnauthorizedAccessException) when (SoftwareCatalog.CanSaveWithAdminRights)
+            {
+                // The machine-wide catalog can be admin-owned; ask for an administrator instead.
+                if (!await SoftwareCatalog.SaveWithAdminRightsAsync(path, definitions))
+                {
+                    Message = CoreTools.Translate("The catalog was not saved.");
+                    return false;
+                }
+            }
+            FilePath = Path.GetFullPath(path);
+            _savedCatalogs = definitions;
+            IsDirty = false;
+            Message = CoreTools.Translate("Catalog saved to {0}.", FilePath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Could not save catalog file {path}.");
+            Logger.Error(ex);
+            SetErrorMessage(CoreTools.Translate("Could not save catalog file {0}: {1}", path, ex.Message));
+            return false;
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    public void DiscardChanges()
+    {
+        if (!CanDiscardChanges) return;
+        string? selectedId = SelectedCatalog?.Id;
+        SearchCommand.Cancel();
+        _loading = true;
+        try
+        {
+            SelectedCatalog = null;
+            Catalogs.Clear();
+            SearchResults.Clear();
+            SelectedResult = null;
+            foreach (var definition in CopyCatalogs(_savedCatalogs))
+            {
+                var catalog = new CatalogEditorCatalog(definition);
+                Attach(catalog);
+                Catalogs.Add(catalog);
+            }
+            SelectedCatalog = Catalogs.FirstOrDefault(c =>
+                string.Equals(c.Id, selectedId, StringComparison.OrdinalIgnoreCase)) ?? Catalogs.FirstOrDefault();
+            IsDirty = false;
+            Message = "";
+        }
+        finally { _loading = false; }
+    }
+
+    private static CatalogDefinition[] CopyCatalogs(IEnumerable<CatalogDefinition> catalogs) =>
+        catalogs.Select(c => new CatalogDefinition
+        {
+            Id = c.Id,
+            Name = c.Name,
+            PkgFeed = c.PkgFeed,
+            AllowUnsignedPackages = c.AllowUnsignedPackages,
+            Packages = c.Packages.Select(p => new CatalogEntry
+            {
+                Id = p.Id,
+                Name = p.Name,
+                Version = p.Version,
+                Source = p.Source,
+                ManagerName = p.ManagerName,
+            }).ToArray(),
+        }).ToArray();
+
+    [RelayCommand]
+    public void NewCatalog()
+    {
+        if (!CanEdit) return;
+        string id = "catalog";
+        int suffix = 1;
+        while (Catalogs.Any(c => string.Equals(c.Id, id, StringComparison.OrdinalIgnoreCase)))
+            id = $"catalog-{++suffix}";
+        var catalog = new CatalogEditorCatalog(new CatalogDefinition
+        {
+            Id = id,
+            Name = CoreTools.Translate("New catalog"),
+            Packages = [],
+        });
+        Attach(catalog);
+        Catalogs.Add(catalog);
+        SelectedCatalog = catalog;
+        IsDirty = true;
+    }
+
+    public void RemoveCatalog(CatalogEditorCatalog catalog)
+    {
+        int index = Catalogs.IndexOf(catalog);
+        if (!CanEdit || index < 0) return;
+        bool wasSelected = ReferenceEquals(SelectedCatalog, catalog);
+        if (wasSelected) SelectedCatalog = null;
+        Catalogs.RemoveAt(index);
+        if (wasSelected)
+            SelectedCatalog = Catalogs.Count == 0 ? null : Catalogs[Math.Min(index, Catalogs.Count - 1)];
+        IsDirty = true;
+        Message = "";
+    }
+
+    [RelayCommand]
+    private void AddPackage()
+    {
+        if (!CanEdit || SelectedCatalog is not { } catalog || SelectedResult is not { } entry) return;
+        if (catalog.Packages.Any(p => p.Matches(entry.Id, entry.ManagerName, entry.Source)))
+        {
+            Message = CoreTools.Translate("This package is already in the selected catalog.");
+            return;
+        }
+        catalog.Packages.Add(entry);
+        Message = "";
+    }
+
+    [RelayCommand]
+    private void RemovePackage()
+    {
+        if (!CanEdit || SelectedCatalog is not { } catalog || SelectedPackage is not { } entry) return;
+        catalog.Packages.Remove(entry);
+        SelectedPackage = null;
+        Message = "";
+    }
+
+    [RelayCommand(CanExecute = nameof(CanSearch))]
+    private async Task SearchAsync(CancellationToken cancellationToken)
+    {
+        if (SelectedManager is not { } manager) return;
+        string query = Query.Trim();
+        IsSearching = true;
+        SearchResults.Clear();
+        SelectedResult = null;
+        Message = "";
+        try
+        {
+            if (!manager.IsReady())
+                throw new InvalidOperationException(CoreTools.Translate("The selected package manager is not ready."));
+            var packages = await Task.Run(() => manager.FindPackages(query), cancellationToken);
+            if (cancellationToken.IsCancellationRequested) return;
+            foreach (var package in packages)
+            {
+                if (SearchResults.Any(p => p.Matches(package))) continue;
+                SearchResults.Add(CatalogEntry.FromPackage(package));
+            }
+            Message = CoreTools.Translate("{0} packages found", SearchResults.Count);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            Logger.Error("Catalog package search failed.");
+            Logger.Error(ex);
+            SetErrorMessage(CoreTools.Translate("Catalog package search failed: {0}", ex.Message));
+        }
+        finally
+        {
+            IsSearching = false;
+        }
+    }
+}

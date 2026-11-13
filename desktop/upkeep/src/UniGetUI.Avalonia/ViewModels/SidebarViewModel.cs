@@ -1,0 +1,267 @@
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using UniGetUI.Avalonia.Infrastructure;
+using UniGetUI.Avalonia.Models;
+using UniGetUI.Avalonia.Views;
+using UniGetUI.Core.Data;
+using UniGetUI.Core.SettingsEngine;
+using UniGetUI.Core.Tools;
+
+namespace UniGetUI.Avalonia.ViewModels;
+
+public partial class SidebarViewModel : ViewModelBase
+{
+    public bool SoftwareCatalogEnabled { get; } = Settings.Get(Settings.K.EnableSoftwareCatalog);
+
+    // An administrator tool, opened from the catalog page rather than the sidebar; off unless asked for.
+    public bool CatalogEditorEnabled { get; } =
+        Settings.Get(Settings.K.EnableSoftwareCatalog) && Settings.Get(Settings.K.EnableCatalogEditor);
+
+    // Only a catalog with packages to offer becomes the startup page; an unset or broken one would
+    // open the app on an empty page. Checked once at startup, like the setting itself.
+    public bool HasUsableCatalog { get; } =
+        Settings.Get(Settings.K.EnableSoftwareCatalog) && SoftwareCatalog.HasUsableCatalog();
+
+    // Turned on and off from Settings > Extensions while the app runs.
+    [ObservableProperty]
+    private bool _gitRepositoriesEnabled = Settings.Get(Settings.K.EnableGitRepositories);
+
+    partial void OnGitRepositoriesEnabledChanged(bool value)
+    {
+        NavigationPages = GetNavigationPages(gitRepositoriesEnabled: value);
+        if (value) return;
+        GitRepositoriesBadgeCount = 0;
+        GitRepositoriesIsLoading = false;
+    }
+
+#if UNIGETUI_XCODE_EXTENSION
+    // Keep a saved preference without starting the extension on an unsupported system.
+    [ObservableProperty]
+    private bool _xcodeEnabled = XcodePlatform.IsSupported && Settings.Get(Settings.K.EnableXcode);
+
+    partial void OnXcodeEnabledChanged(bool value)
+    {
+        NavigationPages = GetNavigationPages(xcodeEnabled: value);
+        if (value) return;
+        XcodeBadgeCount = 0;
+        XcodeIsLoading = false;
+    }
+#endif
+
+    private PageType[] GetNavigationPages(
+        bool? gitRepositoriesEnabled = null,
+        bool? agentSkillsEnabled = null,
+        bool? xcodeEnabled = null) =>
+#if UNIGETUI_XCODE_EXTENSION
+        NavigationPageOrder.Get(
+            SoftwareCatalogEnabled,
+            gitRepositoriesEnabled ?? GitRepositoriesEnabled,
+            agentSkillsEnabled ?? AgentSkillsEnabled,
+            xcodeEnabled ?? XcodeEnabled);
+#else
+        NavigationPageOrder.Get(
+            SoftwareCatalogEnabled,
+            gitRepositoriesEnabled ?? GitRepositoriesEnabled,
+            agentSkillsEnabled ?? AgentSkillsEnabled);
+#endif
+
+    [ObservableProperty]
+    private bool _agentSkillsEnabled = Settings.Get(Settings.K.EnableAgentSkills);
+
+    partial void OnAgentSkillsEnabledChanged(bool value)
+        => NavigationPages = GetNavigationPages(agentSkillsEnabled: value);
+
+    public void SetExtensionEnabled(PageType page, bool enabled)
+    {
+        if (page == PageType.GitRepositories) GitRepositoriesEnabled = enabled;
+        if (page == PageType.AgentSkills) AgentSkillsEnabled = enabled;
+#if UNIGETUI_XCODE_EXTENSION
+        if (page == PageType.Xcode) XcodeEnabled = enabled && XcodePlatform.IsSupported;
+#endif
+    }
+
+    [ObservableProperty]
+    private PageType[] _navigationPages;
+
+    public void ReorderNavigationPages(IReadOnlyList<PageType> pages)
+    {
+        NavigationPageOrder.Save(pages);
+        NavigationPages = GetNavigationPages();
+    }
+
+    public void ResetNavigationPages()
+    {
+        NavigationPageOrder.Reset();
+        NavigationPages = GetNavigationPages();
+    }
+
+    // ─── Badge properties ─────────────────────────────────────────────────────
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(UpdatesBadgeText))]
+    private int _updatesBadgeCount;
+
+    [ObservableProperty]
+    private bool _updatesBadgeVisible;
+
+    [ObservableProperty]
+    private bool _bundlesBadgeVisible;
+
+    public string UpdatesBadgeText => UpdatesBadgeCount > 99 ? "99+" : UpdatesBadgeCount.ToString();
+
+    // Main clones that a fast-forward would bring up to date.
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(GitRepositoriesBadgeText))]
+    [NotifyPropertyChangedFor(nameof(GitRepositoriesBadgeVisible))]
+    private int _gitRepositoriesBadgeCount;
+
+    public bool GitRepositoriesBadgeVisible => GitRepositoriesBadgeCount > 0;
+
+    public string GitRepositoriesBadgeText => GitRepositoriesBadgeCount > 99 ? "99+" : GitRepositoriesBadgeCount.ToString();
+
+    [ObservableProperty]
+    private bool _gitRepositoriesIsLoading;
+
+#if UNIGETUI_XCODE_EXTENSION
+    // Whether a newer Xcode than the newest one installed can be installed; one at most.
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(XcodeBadgeText))]
+    [NotifyPropertyChangedFor(nameof(XcodeBadgeVisible))]
+    private int _xcodeBadgeCount;
+
+    public bool XcodeBadgeVisible => XcodeBadgeCount > 0;
+
+    public string XcodeBadgeText => XcodeBadgeCount > 99 ? "99+" : XcodeBadgeCount.ToString();
+
+    [ObservableProperty]
+    private bool _xcodeIsLoading;
+#endif
+
+    // When the count changes, sync the badge visibility
+    partial void OnUpdatesBadgeCountChanged(int value) =>
+        UpdatesBadgeVisible = value > 0;
+
+    // ─── Loading indicators ───────────────────────────────────────────────────
+    [ObservableProperty]
+    private bool _discoverIsLoading;
+
+    [ObservableProperty]
+    private bool _updatesIsLoading;
+
+    [ObservableProperty]
+    private bool _installedIsLoading;
+
+    // ─── Pane open/closed ─────────────────────────────────────────────────────
+    // NavMenuMode: Automatic mirrors WinUI (dock ≥1600px, else rail+overlay), Docked = always
+    // inline, Overlay = always rail+overlay. IsPaneOpen = labeled pane showing, in any mode.
+    public enum NavMode { Automatic, Docked, Overlay }
+
+    private const double ExpandedThreshold = 1600; // WinUI ExpandedModeThresholdWidth
+    private const double CompactThreshold = 800;    // WinUI CompactModeThresholdWidth
+
+    // Live window width, pushed by MainWindow's bounds observer.
+    [ObservableProperty]
+    private double _windowWidth = 1450;
+
+    [ObservableProperty]
+    private NavMode _mode = ParseMode(Settings.GetValue(Settings.K.NavMenuMode));
+
+    [ObservableProperty]
+    private bool _isPaneOpen;
+
+    public static NavMode ParseMode(string value) => value switch
+    {
+        "docked" => NavMode.Docked,
+        "overlay" => NavMode.Overlay,
+        _ => NavMode.Automatic,
+    };
+
+    // Whether the pane docks inline (vs. the rail + sliding overlay).
+    public bool Docked => Mode switch
+    {
+        NavMode.Docked => true,
+        NavMode.Overlay => false,
+        _ => WindowWidth >= ExpandedThreshold,
+    };
+
+    private bool RailAllowed => WindowWidth >= CompactThreshold;
+
+    // Icon rail vs docked labeled pane vs sliding overlay — mutually exclusive.
+    public bool NavDockVisible => Docked && IsPaneOpen;
+    public bool RailVisible => (Docked && !IsPaneOpen) || (!Docked && RailAllowed);
+    public bool OverlayActive => !Docked && IsPaneOpen;
+
+    private bool _wasDocked;
+
+    public SidebarViewModel()
+    {
+        _navigationPages = GetNavigationPages();
+        _wasDocked = Docked;
+        _isPaneOpen = Docked && !Settings.Get(Settings.K.CollapseNavMenuOnWideScreen);
+    }
+
+    partial void OnWindowWidthChanged(double value) => ReconcileDock();
+
+    partial void OnModeChanged(NavMode value) => ReconcileDock();
+
+    // On a docked-state flip, open the pane by default (unless collapsed on a wide screen), or
+    // collapse when leaving docked mode. Mirrors WinUI's startup IsPaneOpen logic.
+    private void ReconcileDock()
+    {
+        bool docked = Docked;
+        if (docked != _wasDocked)
+        {
+            _wasDocked = docked;
+            IsPaneOpen = docked && !Settings.Get(Settings.K.CollapseNavMenuOnWideScreen);
+        }
+        RaiseLayoutChanged();
+    }
+
+    partial void OnIsPaneOpenChanged(bool value)
+    {
+        // Persist the collapse choice only while docked (WinUI persisted only at ≥1600px).
+        if (Docked)
+            Settings.Set(Settings.K.CollapseNavMenuOnWideScreen, !value);
+        RaiseLayoutChanged();
+    }
+
+    private void RaiseLayoutChanged()
+    {
+        OnPropertyChanged(nameof(NavDockVisible));
+        OnPropertyChanged(nameof(RailVisible));
+        OnPropertyChanged(nameof(OverlayActive));
+    }
+
+    // ─── Selected page ────────────────────────────────────────────────────────
+    [ObservableProperty]
+    private PageType _selectedPageType = PageType.Null;
+
+    // ─── Navigation ──────────────────────────────────────────────────────────
+    public event EventHandler<PageType>? NavigationRequested;
+
+    public string VersionLabel { get; } =
+        CoreTools.Translate("Upkeep Version {0}", CoreData.VersionName);
+
+    [RelayCommand]
+    public void RequestNavigation(string? pageName)
+    {
+        if (Enum.TryParse<PageType>(pageName, out var page))
+            NavigationRequested?.Invoke(this, page);
+    }
+
+    public void SelectNavButtonForPage(PageType page) =>
+        SelectedPageType = page;
+
+    public void SetNavItemLoading(PageType page, bool isLoading)
+    {
+        switch (page)
+        {
+            case PageType.Discover: DiscoverIsLoading = isLoading; break;
+            case PageType.Updates: UpdatesIsLoading = isLoading; break;
+            case PageType.Installed: InstalledIsLoading = isLoading; break;
+            case PageType.GitRepositories: GitRepositoriesIsLoading = isLoading; break;
+#if UNIGETUI_XCODE_EXTENSION
+            case PageType.Xcode: XcodeIsLoading = isLoading; break;
+#endif
+        }
+    }
+}
