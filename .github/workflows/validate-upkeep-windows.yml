@@ -89,8 +89,10 @@ jobs:
           $installerName = "$($manifest.appName)-v$($manifest.version)-x64-Setup.exe"
           $installer = Join-Path $PWD "desktop/upkeep/dist/release/$installerName"
           $seanpak = Join-Path $PWD '.seanpak/target/x86_64-pc-windows-msvc/release/seanpak.exe'
-          & $seanpak verify $installer --sandbox --json
-          $verifyExit = $LASTEXITCODE
+          $verifyProcess = Start-Process -FilePath $seanpak `
+            -ArgumentList @('verify', "`"$installer`"", '--sandbox', '--json') `
+            -Wait -PassThru
+          $verifyExit = $verifyProcess.ExitCode
 
           $diagnostics = Join-Path (Split-Path $seanpak -Parent) 'seanpak.log'
           if (Test-Path $diagnostics) {
